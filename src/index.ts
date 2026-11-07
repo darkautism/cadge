@@ -3,6 +3,7 @@ export { Broker } from "./broker";
 
 const MAX_BODY_BYTES = 256 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const STREAM_SEQUENCE = /^\d+$/;
 
 class BodyError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
@@ -139,8 +140,12 @@ export default {
         && request.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase() === "text/event-stream";
       if (path !== "/beg" && !streamDelivery) body = await readJson(request);
       const claimId = streamDelivery ? request.headers.get("X-Cadge-Claim-ID") : null;
-      if (streamDelivery && (!claimId || !UUID.test(claimId) || !request.body)) {
-        return apiError(400, "SSE delivery requires a claim UUID in X-Cadge-Claim-ID and a request body.", "invalid_delivery");
+      const sequence = streamDelivery ? request.headers.get("X-Cadge-Stream-Sequence") : null;
+      const end = streamDelivery ? request.headers.get("X-Cadge-Stream-End") : null;
+      if (streamDelivery && (!claimId || !UUID.test(claimId)
+        || sequence === null || !STREAM_SEQUENCE.test(sequence) || !Number.isSafeInteger(Number(sequence))
+        || (end !== "0" && end !== "1"))) {
+        return apiError(400, "SSE packets require a claim UUID, a nonnegative safe integer sequence, and stream end 0 or 1.", "invalid_delivery");
       }
       if (path === "/v1/chat/completions") {
         if (!validChat(body!)) return apiError(400, "Provide model, nonempty messages, and an optional boolean stream.", "invalid_request");
@@ -160,6 +165,10 @@ export default {
       const broker = env.BROKER.get(env.BROKER.idFromName("cadge"));
       const headers = new Headers({ "Content-Type": streamDelivery ? "text/event-stream; charset=utf-8" : "application/json" });
       if (claimId) headers.set("X-Cadge-Claim-ID", claimId);
+      if (streamDelivery) {
+        headers.set("X-Cadge-Stream-Sequence", sequence!);
+        headers.set("X-Cadge-Stream-End", end!);
+      }
       if (path === "/v1/chat/completions") {
         const requestId = crypto.randomUUID();
         const deadline = Date.now() + timeout;

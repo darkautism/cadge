@@ -79,7 +79,7 @@ export async function readResponse(source) {
   return validateCompletion(parseJson(text, "Response"));
 }
 
-async function post(config, path, body, signal, streamId) {
+async function post(config, path, body, signal, packet) {
   let response;
   let text;
   try {
@@ -87,13 +87,19 @@ async function post(config, path, body, signal, streamId) {
       method: "POST",
       headers: {
         Authorization: `Bearer ${config.token}`,
-        ...(streamId === undefined
+        ...(packet === undefined
           ? (body === undefined ? {} : { "Content-Type": "application/json" })
-          : { "Content-Type": "text/event-stream", "X-Cadge-Claim-ID": streamId }),
+          : {
+            "Content-Type": "text/event-stream",
+            "Content-Length": String(body.byteLength),
+            "X-Cadge-Claim-ID": packet.id,
+            "X-Cadge-Stream-Sequence": String(packet.sequence),
+            "X-Cadge-Stream-End": packet.end ? "1" : "0",
+          }),
       },
-      ...(streamId === undefined
+      ...(packet === undefined
         ? (body === undefined ? {} : { body: JSON.stringify(body) })
-        : { body, duplex: "half" }),
+        : { body }),
       redirect: "error",
       signal,
     });
@@ -135,30 +141,50 @@ export async function deliver(config, body, signal) {
 export async function deliverStream(config, id, body, signal) {
   if (!validId(id)) throw new Error("A claim UUID from /beg is required for streaming delivery.");
   // Do not open an idle HTTP connection while the Agent is still warming up.
-  // Prefetch only the first nonempty chunk, then retain normal backpressure.
+  // Read ahead at most one bounded packet while its predecessor awaits ACK.
   const source = body instanceof ReadableStream ? body
     : Readable.toWeb(Readable.from(body, { objectMode: false, highWaterMark: 0 }));
   const reader = source.getReader();
+  const buffered = Readable.from((async function* () {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) return;
+      yield chunk.value;
+    }
+  })(), { objectMode: false, highWaterMark: 65_536 });
+  const chunks = buffered[Symbol.asyncIterator]();
   const cancel = () => { void reader.cancel(signal?.reason).catch(() => {}); };
   signal?.addEventListener("abort", cancel, { once: true });
   try {
     if (signal?.aborted) { cancel(); throw signal.reason; }
-    let first = await reader.read();
-    while (!first.done && first.value.byteLength === 0) first = await reader.read();
+    let chunk = await chunks.next();
     if (signal?.aborted) throw signal.reason;
-    async function* chunks() {
-      if (!first.done) yield first.value;
-      for (;;) {
-        const chunk = await reader.read();
-        if (chunk.done) return;
-        yield chunk.value;
-      }
+    let sequence = 0;
+    async function send(bytes, end) {
+      if (!Number.isSafeInteger(sequence)) throw new Error("SSE delivery exceeded the packet sequence limit.");
+      const { status, text } = await post(config, "/deliver", bytes, signal, { id, sequence, end });
+      const accepted = acceptedDelivery(status, text);
+      sequence += 1;
+      return accepted;
     }
-    const { status, text } = await post(config, "/deliver", chunks(), signal, id);
-    return acceptedDelivery(status, text);
+    while (!chunk.done) {
+      // Send immediately, then combine only bytes already available during the
+      // prior exchange; never spend one HTTP round trip per tiny producer write.
+      for (let offset = 0; offset < chunk.value.byteLength; offset += 65_536) {
+        await send(chunk.value.subarray(offset, offset + 65_536), false);
+      }
+      const available = buffered.readableLength;
+      chunk = available > 0
+        ? { done: false, value: buffered.read(available) }
+        : await chunks.next();
+      if (signal?.aborted) throw signal.reason;
+    }
+    // Packet ACKs do not finish a delivery; only the explicit EOF packet does.
+    return await send(new Uint8Array(0), true);
   } finally {
     signal?.removeEventListener("abort", cancel);
     cancel();
+    buffered.destroy();
     reader.releaseLock();
   }
 }

@@ -8,9 +8,14 @@ import { deliverStream } from "../scripts/lib.mjs";
 
 test("a slow SSE source does not open an idle upload before its first nonempty bytes", { timeout: 10_000 }, async (t) => {
   let received = "";
+  const packets = [];
   const server = createServer(async (request, response) => {
     try {
-      for await (const chunk of request) received += chunk;
+      let length = 0;
+      for await (const chunk of request) { received += chunk; length += chunk.byteLength; }
+      packets.push({ sequence: request.headers["x-cadge-stream-sequence"],
+        end: request.headers["x-cadge-stream-end"], length,
+        declaredLength: request.headers["content-length"] });
       response.writeHead(200, { "Content-Type": "application/json", Connection: "close" });
       response.end(JSON.stringify({ accepted: true }));
     } catch {
@@ -36,6 +41,136 @@ test("a slow SSE source does not open an idle upload before its first nonempty b
     "40da2c48-f18d-4cd7-9e5c-e429eb737672", source);
   assert.deepEqual(JSON.parse(accepted), { accepted: true });
   assert.equal(received, bytes, "prefetch must not drop or duplicate the first bytes");
+  assert.deepEqual(packets, [
+    { sequence: "0", end: "0", length: Buffer.byteLength(bytes), declaredLength: String(Buffer.byteLength(bytes)) },
+    { sequence: "1", end: "1", length: 0, declaredLength: "0" },
+  ]);
+});
+
+test("SSE packets preserve raw bytes, bound each body, and await every ACK including EOF", { timeout: 5000 }, async (t) => {
+  const id = "40da2c48-f18d-4cd7-9e5c-e429eb737672";
+  const large = Uint8Array.from({ length: 131_079 }, (_, i) => i % 256);
+  const tail = Uint8Array.from([0xff, 0x00, 0xc3, 0x28]);
+  const chunks = [new Uint8Array(0), large, tail];
+  let reads = 0;
+  const source = new ReadableStream({
+    pull(controller) {
+      if (reads < chunks.length) controller.enqueue(chunks[reads++]);
+      else { reads += 1; controller.close(); }
+    },
+  }, { highWaterMark: 0 });
+  const packets = [];
+  let firstResponse;
+  let finalResponse;
+  let resolveFirst;
+  let resolveFinal;
+  const firstArrived = new Promise(resolve => { resolveFirst = resolve; });
+  const finalArrived = new Promise(resolve => { resolveFinal = resolve; });
+  const acknowledge = response => {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ accepted: true }));
+  };
+  const server = createServer(async (request, response) => {
+    const buffers = [];
+    for await (const chunk of request) buffers.push(chunk);
+    packets.push({ headers: request.headers, bytes: Buffer.concat(buffers) });
+    if (packets.length === 1) { firstResponse = response; resolveFirst(); }
+    else if (request.headers["x-cadge-stream-end"] === "1") { finalResponse = response; resolveFinal(); }
+    else acknowledge(response);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  let settled = false;
+  const delivery = deliverStream({ url: `http://127.0.0.1:${server.address().port}`, token: "packet-agent" }, id, source);
+  delivery.then(() => { settled = true; }, () => { settled = true; });
+  await firstArrived;
+  assert.equal(packets.length, 1, "do not overlap packets from an oversized producer chunk");
+  assert.equal(settled, false);
+  acknowledge(firstResponse);
+  await finalArrived;
+  assert.equal(settled, false, "nonfinal ACKs must not resolve deliverStream");
+  for (const [sequence, packet] of packets.entries()) {
+    assert.ok(packet.bytes.length <= 65_536);
+    assert.equal(packet.headers["content-type"], "text/event-stream");
+    assert.equal(packet.headers["x-cadge-claim-id"], id);
+    assert.equal(packet.headers["x-cadge-stream-sequence"], String(sequence));
+    assert.equal(packet.headers["x-cadge-stream-end"], sequence === packets.length - 1 ? "1" : "0");
+    assert.equal(packet.headers["content-length"], String(packet.bytes.length));
+    assert.equal(packet.headers["transfer-encoding"], undefined);
+  }
+  assert.equal(packets.at(-1).bytes.length, 0);
+  assert.deepEqual(Buffer.concat(packets.map(packet => packet.bytes)), Buffer.concat([large, tail]));
+  acknowledge(finalResponse);
+  assert.deepEqual(JSON.parse(await delivery), { accepted: true });
+  assert.equal(source.locked, false);
+});
+
+test("an empty SSE producer sends only its final packet", { timeout: 5000 }, async (t) => {
+  const packets = [];
+  const server = createServer(async (request, response) => {
+    const buffers = [];
+    for await (const chunk of request) buffers.push(chunk);
+    packets.push({ sequence: request.headers["x-cadge-stream-sequence"],
+      end: request.headers["x-cadge-stream-end"], length: Buffer.concat(buffers).length,
+      declaredLength: request.headers["content-length"] });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ accepted: true }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  const source = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(0)); controller.close(); } });
+  await deliverStream({ url: `http://127.0.0.1:${server.address().port}`, token: "empty-agent" },
+    "40da2c48-f18d-4cd7-9e5c-e429eb737672", source);
+  assert.deepEqual(packets, [{ sequence: "0", end: "1", length: 0, declaredLength: "0" }]);
+  assert.equal(source.locked, false);
+});
+
+test("an unknown packet outcome is not retried and cancels the producer", { timeout: 5000 }, async (t) => {
+  let requests = 0;
+  const server = createServer(async request => {
+    requests += 1;
+    for await (const chunk of request) { /* Consume the finite packet before dropping its ACK. */ }
+    request.socket.destroy();
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  let cancelled = false;
+  const source = new ReadableStream({
+    pull(controller) { controller.enqueue(Uint8Array.of(0x61)); },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 });
+  await assert.rejects(deliverStream({ url: `http://127.0.0.1:${server.address().port}`, token: "failed-agent" },
+    "40da2c48-f18d-4cd7-9e5c-e429eb737672", source), /outcome may be unknown\. Not retrying/);
+  assert.equal(requests, 1);
+  assert.equal(cancelled, true);
+  assert.equal(source.locked, false);
+});
+
+test("cancelling while awaiting a packet ACK cancels and releases the producer", { timeout: 5000 }, async (t) => {
+  const stop = new AbortController();
+  const reason = new Error("stop the packet upload");
+  let requests = 0;
+  const server = createServer(async request => {
+    requests += 1;
+    for await (const chunk of request) { /* Leave the ACK pending until cancellation. */ }
+    stop.abort(reason);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  let cancelledWith;
+  const source = new ReadableStream({
+    pull(controller) { controller.enqueue(Uint8Array.of(0x61)); },
+    cancel(value) { cancelledWith = value; },
+  }, { highWaterMark: 0 });
+  await assert.rejects(deliverStream({ url: `http://127.0.0.1:${server.address().port}`, token: "cancelled-agent" },
+    "40da2c48-f18d-4cd7-9e5c-e429eb737672", source, stop.signal), error => error === reason);
+  assert.equal(requests, 1);
+  assert.equal(cancelledWith, reason);
+  assert.equal(source.locked, false);
 });
 
 test("cancelling before first SSE bytes rejects while the source is still waiting", { timeout: 2000 }, async () => {
@@ -53,6 +188,9 @@ test("the real poller keeps a streaming command alive past expiry after its firs
   const last = 'data: {"choices":[{"delta":{"content":"late"}}]}\n\ndata: [DONE]\n\n';
   let claimed = false;
   let expiresAt;
+  let bytes = "";
+  let firstAt;
+  let sequence = 0;
   let resolveUpload;
   let rejectUpload;
   const uploaded = new Promise((resolve, reject) => { resolveUpload = resolve; rejectUpload = reject; });
@@ -75,15 +213,23 @@ test("the real poller keeps a streaming command alive past expiry after its firs
       return;
     }
     try {
-      let bytes = "";
-      let firstAt;
+      assert.equal(request.headers["content-type"], "text/event-stream");
+      assert.equal(request.headers["x-cadge-claim-id"], id);
+      assert.equal(request.headers["x-cadge-stream-sequence"], String(sequence++));
+      let length = 0;
       for await (const chunk of request) {
         firstAt ??= Date.now();
+        length += chunk.byteLength;
         bytes += chunk;
       }
+      assert.equal(request.headers["content-length"], String(length));
+      const end = request.headers["x-cadge-stream-end"];
+      assert.ok(end === "0" || end === "1");
+      assert.ok(length <= 65_536);
+      if (end === "1") assert.equal(length, 0);
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ accepted: true }));
-      resolveUpload({ bytes, firstAt, finishedAt: Date.now() });
+      if (end === "1") resolveUpload({ bytes, firstAt, finishedAt: Date.now() });
     } catch (error) {
       rejectUpload(error);
     }

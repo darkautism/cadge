@@ -43,7 +43,7 @@ curl http://localhost:8787/v1/chat/completions \
   -d '{"model":"cadge","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-這個連線會等待交付，預設最多 120 秒，包含佇列等待及完整串流時間。既有 OpenAI Chat provider 設定 `base_url=https://<worker-host>/v1`、API key 為 `CLIENT_TOKEN`、model 為 `MODEL_ID`；呼叫端的 timeout 需要比 Cadge deadline 長。即時串流請在 body 加上 `"stream":true`；用 curl 觀察時加 `-N`，避免終端輸出被 curl 緩衝。
+這個連線會等待交付，預設 120 秒包含佇列與首段 SSE 等待；串流首段資料到達後永久解除此期限，非串流則必須在期限內完成。既有 OpenAI Chat provider 設定 `base_url=https://<worker-host>/v1`、API key 為 `CLIENT_TOKEN`、model 為 `MODEL_ID`；呼叫端也必須容許長串流。即時串流請在 body 加上 `"stream":true`；用 curl 觀察時加 `-N`，避免終端輸出被 curl 緩衝。
 
 ### 2. Agent 乞討
 
@@ -107,24 +107,46 @@ curl http://localhost:8787/deliver \
 
 #### 即時串流交付
 
-`job.request.stream === true` 時，使用同一個 `/deliver`，但改送 **raw OpenAI SSE**；UUID 放在 `X-Cadge-Claim-ID`，不加 JSON 外層：
+`job.request.stream === true` 時，將 **raw OpenAI SSE 分成有限長度的 POST**，不再使用一條持續寫入的 chunked HTTP upload。入口代理可能等整個 request EOF 才交給 Worker；有限分段讓每段能立即完成上傳並轉送，不受整份答案生成時間影響。
+
+每段使用同一個 `/deliver`，body 是原始位元組，不加 JSON 外層：
+
+| Header | 值 |
+|---|---|
+| `Content-Type` | `text/event-stream` |
+| `X-Cadge-Claim-ID` | `/beg` 回傳的完整 UUID |
+| `X-Cadge-Stream-Sequence` | 從 `0` 開始、逐段加一的非負 safe integer |
+| `X-Cadge-Stream-End` | 一般段為 `0`；producer EOF 後送空 body 的最後一段為 `1` |
+
+每段最多 **65,536 bytes**，準備好多少就送多少，不等待湊滿。每段都必須讀到 `200 {"accepted":true}` 才送下一段，不可平行上傳或自動重試。單段 ACK 不代表整份答案完成；最後 EOF 段的 ACK 才完成交付。可用有限 bytes body 的 `Content-Length` 避免重新形成長時間 chunked upload。
 
 ```sh
+# chunk.sse 必須不超過 65,536 bytes；之後每段序號依序增加。
 curl http://localhost:8787/deliver \
-  -X POST \
   -H 'Authorization: Bearer local-agent-token-change-before-deploy' \
   -H 'Content-Type: text/event-stream' \
   -H 'X-Cadge-Claim-ID: 727bb93b-9a25-4754-a1ec-12c2a9cc89ad' \
-  --upload-file - < response.sse
+  -H 'X-Cadge-Stream-Sequence: 0' \
+  -H 'X-Cadge-Stream-End: 0' \
+  --data-binary @chunk.sse
+
+# producer 已經 EOF；假設前面只送過一段。
+curl http://localhost:8787/deliver \
+  -H 'Authorization: Bearer local-agent-token-change-before-deploy' \
+  -H 'Content-Type: text/event-stream' \
+  -H 'X-Cadge-Claim-ID: 727bb93b-9a25-4754-a1ec-12c2a9cc89ad' \
+  -H 'X-Cadge-Stream-Sequence: 1' \
+  -H 'X-Cadge-Stream-End: 1' \
+  --data-binary ''
 ```
 
-上例重播 SSE 檔案；即時使用時，將自己的 SSE producer 接到 curl 的 stdin。`--upload-file -` 會邊讀邊上傳；不要使用會先讀完整份 stdin 的 `--data-binary @-`。也可直接使用下方的 `deliver.mjs --stream` 或 polling adapter。
+一般 Agent 請直接使用 `deliver.mjs --stream`、`poll.mjs` 或下方的 Muse integration；它們自動分段並處理 EOF。舊的單一長連線 uploader 不相容，部署時必須同步更新 Agent。Client 的 OpenAI SSE 介面不變。
 
-Cadge 收到資料就轉送給原始 Client，**不等 Agent 上傳結束**；使用下游背壓限制記憶體，不累積完整答案。SSE 註解、UTF-8、文字／tool call chunks、usage 與 `[DONE]` 均原樣傳遞。Cadge 不解析或補造正常 SSE 內容；Agent 必須產生有效的 OpenAI SSE。
+Cadge 保留一條 Client SSE，依序轉送各段，使用下游背壓限制記憶體。SSE 註解、UTF-8、文字／tool call chunks、usage 與 `[DONE]` 均原樣傳遞；SSE frame 或 UTF-8 字元可跨分段邊界。Cadge 不解析或補造 SSE 內容，也不插入 heartbeat。Client 中途離開後，識別碼保留期間內仍正常接收並丟棄後續段，不通知或中斷 Agent。
 
-自訂 Agent 應先等首段 SSE 準備好，再建立 `/deliver` 上傳，而不是暖機前先開一條沒有資料的連線。repo 的 `deliver.mjs --stream` 與 `poll.mjs` 已自動採此方式：只預讀首個非空 chunk，隨即建立 HTTP 上傳並逐段轉送，避免暖機期間空等的上傳連線被對端／代理關閉；不會因此累積整份答案。這是上傳初始化的處理，不是新增首字時限。
+Node uploader 在等待上一段 ACK 時使用有限預讀緩衝，下一段合併當時已經就緒的位元組；不等待湊滿、不加 batching timer，避免每個小 token write 都多付一次 HTTP 往返。這不改變 SSE 內容或分段序號規則。
 
-Agent 的上傳讀到 EOF 後才回 `200 {"accepted":true}`。Client 中途離開時停止轉送，但持續讀取並丟棄 Agent 剩餘串流，最後仍回相同收件成功，不中斷或通知 Agent。
+`/beg` 的 `204`／`200` 已直接區分空佇列與領取成功，沒有第二個派發 API。Muse 的 `wake → side_chat` 是執行該筆工作的模型入口，不是再派發一次。預設 5 秒空輪詢仍可能增加最多約 5 秒的起始等待；Muse 排程與模型生成也在 Cadge 傳輸之外。比較原生 API 時，應分別量測領取等待、上游首個內容與 Client 收到該內容的時間，不把模型思考或 Agent 喚醒算成 relay 延遲。
 
 #### 處理失敗
 
@@ -148,17 +170,18 @@ Agent 處理失敗也必須交付，讓 Client 不必等到逾時：
 | 未知模型、未知 UUID、正在／已成功交付的 UUID | 404 |
 | 已取消／逾時的已領取 UUID，仍在識別碼保留期間內 | Agent 200，正常收件回應，結果丟棄 |
 | JSON 成功交付給串流工作／SSE 交付給非串流工作 | 409，`stream_required`／`stream_not_requested`，不消耗領取 UUID |
-| JSON body 超過 256 KiB | 413 |
+| SSE 段重疊或序號不是下一個預期值 | 409，`stream_packet_in_progress`／`stream_sequence_mismatch`，不消耗預期序號 |
+| JSON body 超過 256 KiB／單一 SSE 段超過 65,536 bytes | 413 |
 | Agent 回報失敗 | Client 502 |
 | 缺少／重複 secrets、設定錯誤或協調器中斷 | 503 |
 | 尚未開始回傳 SSE 就到期 | Client 504 |
-| SSE 已開始後到期／Agent 上傳中斷 | Client SSE error，`request_timeout`／`agent_stream_error`，不補 `[DONE]` |
+| 有效 SSE 段讀取或轉送中斷 | Client SSE error，`agent_stream_error`，不補 `[DONE]` |
 
-256 KiB 上限適用 Client JSON 請求與 JSON 交付，依實際 UTF-8 位元組數檢查，不依賴 `Content-Length`。raw SSE 交付沒有此總長度上限，也不會先讀完整份串流。大型圖片請使用 URL，而不是大型 base64 請求 body。
+256 KiB 上限適用 Client JSON 請求與 JSON 交付；SSE 每段上限為 65,536 bytes，整份串流沒有總長度上限。兩者依實際位元組數檢查，不只信任 `Content-Length`。大型圖片請使用 URL，而不是大型 base64 請求 body。
 
 待辦請求保存在 SQLite；交付、取消或到期時刪除 prompt，不保存結果。取消／逾時的已領取 UUID 僅保留約 5 分鐘的無內容標記，期間內晚到的有效交付仍回 `200 {"accepted":true}`，不回傳 `discarded` 等額外欄位。超過識別碼保留期則視為未知 UUID、回 `404`；標記由 alarm 批次清理。
 
-**不自動重新派工。** Agent 領取後失聯、初始期限內仍未開始回覆時，尚未開啟回應的請求回 `504`；若已開啟 SSE 但仍沒有資料，則以 `request_timeout` 錯誤事件結束，HTTP 狀態無法再更改。已收到首段的串流不再受初始期限限制；上傳本身失敗仍以 SSE 錯誤結束。同一份仍有效的請求只會轉交一次，但這不等於外部模型推理 exactly-once：若領取回應在網路途中遺失，該工作仍已領取。對已結束工作的正常收件回應不代表重新轉交。
+**不自動重新派工或重送分段。** Agent 領取後失聯、初始期限內仍未開始回覆時，Client 回 `504`。已收到首段的串流不再受初始期限限制；有效分段的傳輸失敗以 SSE 錯誤結束。若 Agent 在兩段之間失聯，服務端無從區分失聯與合法沉默，因此不另設 idle timeout，需由 Client 取消連線。領取或分段 ACK 在網路途中遺失時，不可盲目重試；本服務不保證外部推理 exactly-once。已結束工作的正常收件回應不代表重新轉交。
 
 HTTP 連線與記憶體中的等待者不能跨 runtime 重啟還原。重啟時清除無法再交付的前一個 runtime 工作；Client 可能收到連線錯誤或 `503`。此 API 沒有非同步結果查詢或跨連線恢復。
 
@@ -214,7 +237,7 @@ export CADGE_AGENT_TOKEN='local-agent-token-change-before-deploy'
 
 領取成功時 stdout 是一筆完整 job JSON：`{id, request, expires_at}`；沒有工作時 stdout 為空、exit code 為 `0`。這個 hook **只問一次，不自動 sleep**，適合掛在既有 Agent 的 idle／取得下一份工作事件。設定、網路或 HTTP 錯誤寫入 stderr，exit code 非零。
 
-Agent 要保留 `id`，讀取 `request.messages` 與其他模型參數，再於 `expires_at` 前完成工作。job JSON 包含使用者 prompt，不要寫入公開 log；若存成檔案，使用私人目錄並在交付後移除。
+Agent 要保留 `id`，讀取同一筆 `request.messages` 與其他模型參數，再於 `expires_at` 前送出首段 SSE 或完成非串流交付。job JSON 包含使用者 prompt，不要寫入公開 log；若存成檔案，使用私人目錄並在交付後移除。
 
 ### 單次交付 hook
 
@@ -253,6 +276,18 @@ poller 預設空等 **5 秒**再領，`CADGE_POLL_INTERVAL_MS=10000` 可改成 1
 `Ctrl-C`／`SIGTERM` 會停止 polling 並終止正在執行的子程式，不會交付假答案。尚未輸出非空 SSE chunk 的串流子程式及尚未完成的非串流程式，在初始 deadline 到達時也會終止；**串流首段輸出後永久解除此 timer，不再因原始 deadline 殺掉子程式**。POSIX 系統會終止子程式群組，必要時在 1 秒後強制結束。尚未開始交付的工作不自動重派，原始 Client 會逾時；因 Agent 自身停止而中斷的串流仍回報錯誤。這不是 Client 取消時通知 Agent。
 
 
+### Muse
+
+`integrations/muse/` 是實際 Muse hook 的更新來源，保留 Secure Vault／surrogate 認證，不包含 token：
+
+```sh
+bash integrations/muse/install.sh
+```
+
+安裝後將印出的 hook JSON 匯入／更新至 Muse，再啟用 hook；安裝器不會自行啟用遠端工作。Worker 與 Agent 必須一起更新，不能沿用舊的長連線 `deliver.py`。
+
+串流 worker 使用 `start_stream.sh` 建立每個完整 claim UUID 專用的串流檔，逐段 append SSE，最後呼叫 `finish_stream.sh <dir>`。完成 helper 依明確的 producer EOF 標記排空所有位元組並等待最後 ACK，不再猜測 sleep 兩秒或 kill tail 的時機。首段後沒有 producer idle／總時長期限。詳細介面見 [Muse integration](integrations/muse/README.md)。
+
 ## 部署到 Cloudflare
 
 ### 1. 安裝與登入
@@ -268,7 +303,7 @@ npx wrangler login
 
 ### 2. 確認設定
 
-編輯 `wrangler.jsonc`：`name` 是 Worker 名稱，預設 `cadge`；`vars.MODEL_ID` 是 Client 使用的模型名；`vars.REQUEST_TIMEOUT_MS` 是整筆請求的等待期限。若帳號已有同名但不相關的 Worker，先改 `name`，避免覆蓋。
+編輯 `wrangler.jsonc`：`name` 是 Worker 名稱，預設 `cadge`；`vars.MODEL_ID` 是 Client 使用的模型名；`vars.REQUEST_TIMEOUT_MS` 是排隊與等待首段 SSE／非串流完整回覆的初始期限，並非已開始串流的總期限。若帳號已有同名但不相關的 Worker，先改 `name`，避免覆蓋。
 
 保留 `durable_objects` binding 與 `migrations`。它們會在首次部署時建立 SQLite-backed `Broker`，不需要手動建立 Queue、D1 或 KV。不要把 token 放進 `vars`。
 
@@ -418,7 +453,7 @@ Cloudflare 官方目前支援在 Workers Free 使用 **SQLite-backed Durable Obj
 
 `204` 只是最省 body 的正確語意，**沒有任何「free-call 狀態碼」**。每次 `/beg` 都算 Worker 請求，並呼叫一次 Durable Object；`200`、`204`、`304` 或 `404` 不會改變這點。
 
-預設每個 Agent 空等時每 **5 秒** polling，可用 hook 的 `CADGE_POLL_INTERVAL_MS=10000` 改成 10 秒，不強制退避。每個 Agent 每日空 polling 約 17,280 次（5 秒）或 8,640 次（10 秒）；少量 Agent 可在免費請求額度內運作，另留額度給提問、交付、其他 API 與 alarms。成功交付後會立即領下一筆。
+預設每個 Agent 空等時每 **5 秒** polling，可用 hook 的 `CADGE_POLL_INTERVAL_MS=10000` 改成 10 秒，不強制退避。每個 Agent 每日空 polling 約 17,280 次（5 秒）或 8,640 次（10 秒）；每個 SSE 分段與最後 EOF 也各算一次 Worker 與 Durable Object 請求，須另留額度給提問、非串流交付、其他 API 與 alarms。成功交付後會立即領下一筆。
 
 目前是一個共用 Durable Object，等待中的 Client 會讓它保持 active，duration 不是 CPU time。依官方定價範例的 128 MB 換算，單一 Object 連續 active 24 小時約 `86400 × 0.128 = 11059.2 GB-s`；其他 Objects 與用量仍共用配額。空 polling 不重設相同 deadline 的 alarm，避免無意義的 alarm 寫入，但仍會有 SQL 讀取成本。
 

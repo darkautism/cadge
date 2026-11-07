@@ -1,0 +1,5 @@
+id: "custom.cadge"
+title: "Cadge"
+description: "Claim Cadge jobs and deliver JSON or bounded SSE packets through its registered agent API."
+include_in_prompt: true
+require_auth: true

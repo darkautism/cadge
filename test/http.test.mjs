@@ -159,38 +159,45 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-async function beginStream(t, runtime, id) {
-  const upload = new TransformStream();
-  const writer = upload.writable.getWriter();
+async function beginPackets(t, runtime, id) {
   const abort = new AbortController();
-  const delivery = fetch(new URL("/deliver", await runtime.unsafeGetDirectURL()), {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${AGENT_TOKEN}`,
-      "Content-Type": "text/event-stream",
-      "X-Cadge-Claim-ID": id,
-    },
-    body: upload.readable,
-    duplex: "half",
-    signal: abort.signal,
-  });
-  void delivery.catch(() => {});
-  t.after(() => { abort.abort(); void writer.abort().catch(() => {}); });
+  const finished = deferred();
+  let sequence = 0;
+  void finished.promise.catch(() => {});
+  t.after(() => abort.abort());
+  const send = async (body, final) => {
+    const response = await fetch(new URL("/deliver", await runtime.unsafeGetDirectURL()), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${AGENT_TOKEN}`,
+        "Content-Type": "text/event-stream",
+        "X-Cadge-Claim-ID": id,
+        "X-Cadge-Stream-Sequence": String(sequence),
+        "X-Cadge-Stream-End": final ? "1" : "0",
+      },
+      body,
+      signal: abort.signal,
+    });
+    if (final) finished.resolve(response);
+    else await assertAccepted(response);
+    sequence++;
+  };
   return {
-    delivery,
-    write: (chunk) => writer.write(typeof chunk === "string" ? encoder.encode(chunk) : chunk),
-    close: () => writer.close(),
-    fail: (error) => writer.abort(error),
+    delivery: finished.promise,
+    write: (chunk) => send(typeof chunk === "string" ? encoder.encode(chunk) : chunk, false),
+    close: () => send("", true),
   };
 }
 
-function postStream(runtime, id, body = "data: [DONE]\n\n") {
+function postPacket(runtime, id, body = "data: [DONE]\n\n", sequence = 0, final = true) {
   return runtime.dispatchFetch("http://cadge.test/deliver", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${AGENT_TOKEN}`,
       "Content-Type": "text/event-stream",
       "X-Cadge-Claim-ID": id,
+      "X-Cadge-Stream-Sequence": String(sequence),
+      "X-Cadge-Stream-End": final ? "1" : "0",
     },
     body,
   });
@@ -372,13 +379,13 @@ test("simultaneous deliveries consume a claim once and return the winning answer
   assert.deepEqual(await returned.json(), answers[winner]);
 });
 
-test("SSE reaches the client before upload EOF and preserves comments, Unicode, tools, usage, and DONE byte-for-byte", { timeout: 30_000 }, async (t) => {
+test("SSE reaches the client before producer EOF and preserves comments, Unicode, tools, usage, and DONE byte-for-byte", { timeout: 30_000 }, async (t) => {
   const runtime = await createRuntime(t, 10_000);
   const request = chatRequest("stream-exact", { stream: true, stream_options: { include_usage: true } });
   const pending = startChat(runtime, request);
   const [claim] = await claimRequests(runtime, 1);
   assert.deepEqual(claim.request, request, "stream:true and stream_options must reach the agent unchanged");
-  const upload = await beginStream(t, runtime, claim.id);
+  const upload = await beginPackets(t, runtime, claim.id);
   const first = encoder.encode(': heartbeat\r\ndata: {"id":"chatcmpl-wire","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"}}]}\r\n\r\n');
   const tail = Buffer.from(
     'data: {"id":"chatcmpl-wire","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Zürich 🌊"}}]}\n\n' +
@@ -423,7 +430,7 @@ test("JSON success cannot consume a streaming claim, but a subsequent SSE upload
   await assertApiError(await post(runtime, "/deliver", AGENT_TOKEN, {
     id: claim.id, response: completion("not-a-stream"),
   }), 409, "stream_required");
-  const upload = await beginStream(t, runtime, claim.id);
+  const upload = await beginPackets(t, runtime, claim.id);
   const bytes = encoder.encode('data: {"choices":[{"delta":{"content":"actual stream"}}]}\n\ndata: [DONE]\n\n');
   await upload.write(bytes);
   await upload.close();
@@ -437,7 +444,7 @@ test("SSE cannot consume a nonstream claim, which remains usable for JSON succes
   const runtime = await createRuntime(t, 5000);
   const pending = startChat(runtime, chatRequest("needs-json"));
   const [claim] = await claimRequests(runtime, 1);
-  await assertApiError(await postStream(runtime, claim.id), 409, "stream_not_requested");
+  await assertApiError(await postPacket(runtime, claim.id), 409, "stream_not_requested");
   const answer = completion("needs-json");
   await assertAccepted(await post(runtime, "/deliver", AGENT_TOKEN, { id: claim.id, response: answer }));
   assert.deepEqual(await (await pending).json(), answer);
@@ -453,27 +460,26 @@ test("JSON agent errors are accepted for a streaming request before upload start
   await assertApiError(await pending, 502);
 });
 
-test("an active SSE upload excludes concurrent and finished deliveries", { timeout: 30_000 }, async (t) => {
+test("an active packet stream excludes duplicate sequences and JSON errors without losing the next packet", { timeout: 30_000 }, async (t) => {
   const runtime = await createRuntime(t, 5000);
   const pending = startChat(runtime, chatRequest("stream-race", { stream: true }));
   const [claim] = await claimRequests(runtime, 1);
-  const upload = await beginStream(t, runtime, claim.id);
+  const upload = await beginPackets(t, runtime, claim.id);
   const first = encoder.encode(": active\n\n");
   await upload.write(first);
   const response = await pending;
   const reader = response.body.getReader();
   await readPrefix(reader, first);
-  for (const id of [claim.id, UNKNOWN_CLAIM_ID]) {
-    await assertApiError(await postStream(runtime, id), 404);
-  }
+  await assertApiError(await postPacket(runtime, claim.id), 409, "stream_sequence_mismatch");
+  await assertApiError(await postPacket(runtime, UNKNOWN_CLAIM_ID), 404);
   await assertApiError(await post(runtime, "/deliver", AGENT_TOKEN, {
     id: claim.id, error: { message: "racing error" },
-  }), 404);
+  }), 409, "stream_in_progress");
   await upload.write("data: [DONE]\n\n");
   await upload.close();
   assert.equal((await readRemaining(reader)).toString(), "data: [DONE]\n\n");
   await assertAccepted(await upload.delivery);
-  await assertApiError(await postStream(runtime, claim.id), 404);
+  await assertApiError(await postPacket(runtime, claim.id), 404);
 });
 
 test("a streaming claim canceled before delivery drains and acknowledges a stale upload", { timeout: 30_000 }, async (t) => {
@@ -484,16 +490,16 @@ test("a streaming claim canceled before delivery drains and acknowledges a stale
   await closed;
   // As in the JSON cancellation regression, allow transport cleanup to reach the broker.
   await delay(100);
-  const upload = await beginStream(t, runtime, claim.id);
+  const upload = await beginPackets(t, runtime, claim.id);
   let acknowledged = false;
   void upload.delivery.then(() => { acknowledged = true; }, () => {});
   const frame = `: discarded ${"x".repeat(4096)}\n\n`;
   for (let index = 0; index < 80; index++) await upload.write(frame);
-  assert.equal(acknowledged, false, "even an abandoned client's upload must drain until EOF");
+  assert.equal(acknowledged, false, "packet ACKs must not finish the producer before explicit EOF");
   await upload.write("data: [DONE]\n\n");
   await upload.close();
   await assertAccepted(await upload.delivery);
-  await assertAccepted(await postStream(runtime, claim.id));
+  await assertAccepted(await postPacket(runtime, claim.id, "", 987, false));
   await assertAccepted(await post(runtime, "/deliver", AGENT_TOKEN, {
     id: claim.id, response: completion("repeat-stale-discard"),
   }));
@@ -505,7 +511,7 @@ test("a stream larger than 256 KiB is relayed in modest frames without a total b
   const runtime = await createRuntime(t, 10_000);
   const pending = startChat(runtime, chatRequest("large-stream", { stream: true }));
   const [claim] = await claimRequests(runtime, 1);
-  const upload = await beginStream(t, runtime, claim.id);
+  const upload = await beginPackets(t, runtime, claim.id);
   const frame = `data: ${JSON.stringify({ choices: [{ delta: { content: "x".repeat(4096) } }] })}\n\n`;
   const expected = Buffer.from(frame.repeat(80) + "data: [DONE]\n\n");
   assert.ok(expected.byteLength > 256 * 1024);
@@ -525,7 +531,7 @@ test("a disconnected midstream client does not abort the agent upload or requeue
   const runtime = await createRuntime(t, 10_000);
   const { client, closed, response: responsePromise } = await openChatSocket(runtime, "stream-disconnect", { stream: true });
   const [claim] = await claimRequests(runtime, 1);
-  const upload = await beginStream(t, runtime, claim.id);
+  const upload = await beginPackets(t, runtime, claim.id);
   const first = ": before disconnect\n\n";
   await upload.write(first);
   const response = await responsePromise;
@@ -550,12 +556,12 @@ test("a disconnected midstream client does not abort the agent upload or requeue
   assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
 });
 
-test("a timed-out streaming claim drains a late SSE upload and acknowledges only at EOF", { timeout: 30_000 }, async (t) => {
+test("a timed-out streaming claim acknowledges late packets without reviving the request", { timeout: 30_000 }, async (t) => {
   const runtime = await createRuntime(t);
   const pending = startChat(runtime, chatRequest("stale-stream", { stream: true }));
   const [claim] = await claimRequests(runtime, 1);
   await assertApiError(await pending, 504, "request_timeout");
-  const upload = await beginStream(t, runtime, claim.id);
+  const upload = await beginPackets(t, runtime, claim.id);
   let acknowledged = false;
   void upload.delivery.then(() => { acknowledged = true; }, () => {});
   const frame = `: ${"discard".repeat(1024)}\n\n`;
@@ -571,7 +577,7 @@ test("first SSE bytes remove the deadline through idle gaps, alarms, and later q
   const runtime = await createRuntime(t, 1500);
   const pending = startChat(runtime, chatRequest("stream-first-byte-deadline", { stream: true }));
   const [claim] = await claimRequests(runtime, 1);
-  const upload = await beginStream(t, runtime, claim.id);
+  const upload = await beginPackets(t, runtime, claim.id);
   const first = encoder.encode('data: {"choices":[{"delta":{"content":"first"}}]}\n\n');
   await upload.write(first);
   const response = await pending;
@@ -598,7 +604,8 @@ test("opening SSE upload headers without bytes does not remove the initial deadl
   const upload = httpRequest(new URL("/deliver", await runtime.unsafeGetDirectURL()), {
     method: "POST",
     headers: { Authorization: `Bearer ${AGENT_TOKEN}`, "Content-Type": "text/event-stream",
-      "X-Cadge-Claim-ID": claim.id, "Transfer-Encoding": "chunked" },
+      "X-Cadge-Claim-ID": claim.id, "X-Cadge-Stream-Sequence": "0", "X-Cadge-Stream-End": "0",
+      "Transfer-Encoding": "chunked" },
   });
   const acknowledged = new Promise((resolve, reject) => {
     upload.on("error", reject);
@@ -611,10 +618,7 @@ test("opening SSE upload headers without bytes does not remove the initial deadl
   void acknowledged.catch(() => {});
   t.after(() => upload.destroy());
   upload.flushHeaders();
-  const response = await pending;
-  assertStreamHeaders(response);
-  const terminal = JSON.parse((await response.text()).trim().replace(/^data:\s*/, ""));
-  assert.equal(terminal.error.code, "request_timeout");
+  await assertApiError(await pending, 504, "request_timeout");
   assert.ok(Date.now() >= claim.expires_at);
   upload.end(": late bytes are discarded\n\ndata: [DONE]\n\n");
   const accepted = await acknowledged;
@@ -622,26 +626,190 @@ test("opening SSE upload headers without bytes does not remove the initial deadl
   assert.deepEqual(JSON.parse(accepted.body), { accepted: true });
 });
 
-test("producer transport failure before DONE fails delivery and cannot fabricate a completed stream", { timeout: 30_000 }, async (t) => {
+test("a broken later packet fails the stream without fabricating DONE", { timeout: 30_000 }, async (t) => {
   const runtime = await createRuntime(t, 5000);
   const pending = startChat(runtime, chatRequest("stream-producer-failure", { stream: true }));
   const [claim] = await claimRequests(runtime, 1);
-  const upload = await beginStream(t, runtime, claim.id);
   const first = encoder.encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
-  await upload.write(first);
+  const firstPacket = postPacket(runtime, claim.id, first, 0, false);
   const response = await pending;
   assertStreamHeaders(response);
   const reader = response.body.getReader();
   await readPrefix(reader, first);
+  await assertAccepted(await firstPacket);
   const remainder = readRemaining(reader);
-  await upload.fail(new Error("Agent input transport failed"));
-  let delivered;
-  try { delivered = await upload.delivery; } catch { /* A broken upload can reject fetch itself. */ }
-  if (delivered) assert.ok(delivered.status >= 400, "a broken upload must not be acknowledged as successful");
+  const upload = httpRequest(new URL("/deliver", await runtime.unsafeGetDirectURL()), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${AGENT_TOKEN}`, "Content-Type": "text/event-stream",
+      "X-Cadge-Claim-ID": claim.id, "X-Cadge-Stream-Sequence": "1", "X-Cadge-Stream-End": "0",
+      "Transfer-Encoding": "chunked" },
+  });
+  upload.on("error", () => {});
+  t.after(() => upload.destroy());
+  upload.write("data: incomplete packet");
+  // Let the packet enter the Worker before breaking the HTTP body.
+  await delay(100);
+  upload.destroy(new Error("Agent input transport failed"));
   const tail = await remainder;
   assert.equal(tail.includes(Buffer.from("[DONE]")), false);
   const terminal = JSON.parse(tail.toString().trim().replace(/^data:\s*/, ""));
   assert.equal(terminal.error.code, "agent_stream_error");
+  await assertApiError(await postPacket(runtime, claim.id, "", 1), 404);
+  assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
+});
+
+test("SSE packet headers are validated at both the public router and Durable Object boundary", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t);
+  const namespace = await runtime.getDurableObjectNamespace("BROKER");
+  const broker = namespace.get(namespace.idFromName("cadge"));
+  const valid = {
+    "Content-Type": "text/event-stream",
+    "X-Cadge-Claim-ID": UNKNOWN_CLAIM_ID,
+    "X-Cadge-Stream-Sequence": "0",
+    "X-Cadge-Stream-End": "1",
+  };
+  const invalid = [
+    ["X-Cadge-Claim-ID", null], ["X-Cadge-Claim-ID", "not-a-uuid"],
+    ["X-Cadge-Stream-Sequence", null], ["X-Cadge-Stream-Sequence", ""],
+    ...["-1", "1.5", "1e2", "NaN", "Infinity", "9007199254740992"].map(value => ["X-Cadge-Stream-Sequence", value]),
+    ["X-Cadge-Stream-End", null], ["X-Cadge-Stream-End", ""],
+    ["X-Cadge-Stream-End", "true"], ["X-Cadge-Stream-End", "2"],
+  ];
+  for (const send of [
+    init => runtime.dispatchFetch("http://cadge.test/deliver", init),
+    init => broker.fetch("https://broker/deliver", init),
+  ]) {
+    for (const [name, value] of invalid) {
+      const headers = new Headers({ ...valid, Authorization: `Bearer ${AGENT_TOKEN}` });
+      if (value === null) headers.delete(name);
+      else headers.set(name, value);
+      await assertApiError(await send({ method: "POST", headers, body: "data: test\n\n" }), 400, "invalid_delivery");
+    }
+    // An omitted body is a valid empty final packet, but does not make an unknown claim valid.
+    await assertApiError(await send({ method: "POST", headers: {
+      ...valid, Authorization: `Bearer ${AGENT_TOKEN}`,
+    } }), 404, "claim_not_found");
+  }
+});
+
+test("packets are bounded, ordered, byte-transparent, and require explicit EOF without corrupting a rejected claim", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 10_000);
+  const pending = startChat(runtime, chatRequest("packet-limits", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  let responseStarted = false;
+  void pending.then(() => { responseStarted = true; });
+  await assertApiError(await postPacket(runtime, claim.id, new Uint8Array(65537), 0, false), 413, "invalid_delivery");
+  await assertApiError(await postPacket(runtime, claim.id, "", 0, false), 400, "invalid_delivery");
+  await assertApiError(await postPacket(runtime, claim.id, ": skipped\n\n", 1, false), 409, "stream_sequence_mismatch");
+  assert.equal(responseStarted, false, "a rejected packet must not begin or write to the client stream");
+  const bytes = Uint8Array.from({ length: 65536 }, (_, index) => index % 256);
+  let responseEnded = false;
+  const received = pending.then(async response => {
+    assertStreamHeaders(response);
+    const body = Buffer.from(await response.arrayBuffer());
+    responseEnded = true;
+    return body;
+  });
+  void received.catch(() => {});
+  await assertAccepted(await postPacket(runtime, claim.id, bytes, 0, false));
+  assert.equal(responseEnded, false, "a nonfinal ACK must not close the client stream");
+  await assertApiError(await postPacket(runtime, claim.id, "duplicate", 0, false), 409, "stream_sequence_mismatch");
+  await assertApiError(await postPacket(runtime, claim.id, "skipped", 2, false), 409, "stream_sequence_mismatch");
+  await assertAccepted(await postPacket(runtime, claim.id, "", 1));
+  assert.deepEqual(await received, Buffer.from(bytes));
+  await assertApiError(await postPacket(runtime, claim.id, "", 2), 404, "claim_not_found");
+});
+
+test("a packet is fully read before forwarding and excludes overlapping packets without blocking other claims", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 10_000);
+  const pending = startChat(runtime, chatRequest("packet-overlap", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  let responseStarted = false;
+  void pending.then(() => { responseStarted = true; });
+  const upload = httpRequest(new URL("/deliver", await runtime.unsafeGetDirectURL()), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${AGENT_TOKEN}`, "Content-Type": "text/event-stream",
+      "X-Cadge-Claim-ID": claim.id, "X-Cadge-Stream-Sequence": "0", "X-Cadge-Stream-End": "0",
+      "Transfer-Encoding": "chunked" },
+  });
+  const accepted = new Promise((resolve, reject) => {
+    upload.on("error", reject);
+    upload.on("response", response => {
+      let body = "";
+      response.setEncoding("utf8").on("data", chunk => { body += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode, body }));
+    });
+  });
+  void accepted.catch(() => {});
+  t.after(() => upload.destroy());
+  upload.write(": partial packet");
+  await delay(100);
+  assert.equal(responseStarted, false, "partial packet bytes must not escape before validation");
+  for (const sequence of [0, 1]) {
+    await assertApiError(await postPacket(runtime, claim.id, ": overlapping\n\n", sequence, false), 409, "stream_packet_in_progress");
+  }
+  await assertApiError(await post(runtime, "/deliver", AGENT_TOKEN, {
+    id: claim.id, error: { message: "racing error" },
+  }), 404);
+  const other = startChat(runtime, chatRequest("unrelated-packet-claim"));
+  const [otherClaim] = await claimRequests(runtime, 1);
+  const answer = completion("unrelated-packet-claim");
+  await assertAccepted(await post(runtime, "/deliver", AGENT_TOKEN, { id: otherClaim.id, response: answer }));
+  assert.deepEqual(await (await other).json(), answer);
+  upload.end(" complete\n\n");
+  const response = await pending;
+  assertStreamHeaders(response);
+  const reader = response.body.getReader();
+  await readPrefix(reader, encoder.encode(": partial packet complete\n\n"));
+  assert.deepEqual(await accepted, { status: 200, body: '{"accepted":true}' });
+  await assertAccepted(await postPacket(runtime, claim.id, "", 1));
+  assert.equal((await readRemaining(reader)).byteLength, 0);
+});
+
+test("an empty final packet at sequence zero completes an empty stream without starting its deadline exemption", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t);
+  const pending = startChat(runtime, chatRequest("empty-packet-stream", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  await assertAccepted(await postPacket(runtime, claim.id, "", 0));
+  const response = await pending;
+  assertStreamHeaders(response);
+  assert.equal((await response.arrayBuffer()).byteLength, 0);
+  await delay(REQUEST_TIMEOUT_MS);
+  await assertApiError(await postPacket(runtime, claim.id, "", 0), 404, "claim_not_found");
+  assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
+});
+
+test("a paused client backpressures sequential packets and cancellation releases the producer", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 10_000);
+  const pending = startChat(runtime, chatRequest("packet-backpressure", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  const packet = new Uint8Array(65536).fill(120);
+  const firstPacket = postPacket(runtime, claim.id, packet, 0, false);
+  const response = await pending;
+  assertStreamHeaders(response);
+  const reader = response.body.getReader();
+  await readPrefix(reader, packet);
+  await assertAccepted(await firstPacket);
+  let acceptedPackets = 0;
+  const producer = (async () => {
+    for (let sequence = 1; sequence <= 128; sequence++) {
+      await assertAccepted(await postPacket(runtime, claim.id, packet, sequence, false));
+      acceptedPackets++;
+    }
+    await assertAccepted(await postPacket(runtime, claim.id, "", 129));
+  })();
+  void producer.catch(() => {});
+  const completedWhilePaused = await Promise.race([
+    producer.then(() => true),
+    delay(500).then(() => false),
+  ]);
+  assert.equal(completedWhilePaused, false, "a paused consumer must not permit unbounded packet buffering");
+  const before = acceptedPackets;
+  await delay(100);
+  assert.equal(acceptedPackets, before, "packet acknowledgements must wait for downstream demand");
+  await reader.cancel("client stopped consuming");
+  await producer;
+  assert.equal(acceptedPackets, 128, "canceled claims must drain and ACK subsequent packets");
   assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
 });
 

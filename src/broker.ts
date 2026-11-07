@@ -2,6 +2,12 @@ import { apiError, type ChatRequest, type Completion, type Env } from "./protoco
 
 const CLEANUP_BATCH_SIZE = 128;
 const TOMBSTONE_RETENTION_MS = 5 * 60 * 1000;
+const MAX_PACKET_BYTES = 65536;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+class PacketError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
 
 interface StreamRelay {
   push: (chunk: Uint8Array) => Promise<void>;
@@ -14,6 +20,7 @@ interface Waiter {
   expiresAt: number;
   streaming: boolean;
   streamStarted: boolean;
+  nextSequence: number;
   relay?: StreamRelay;
   resolve: (response: Response) => void;
   timer: number;
@@ -138,6 +145,7 @@ export class Broker {
       resolve,
       streaming: (JSON.parse(body) as ChatRequest).stream === true,
       streamStarted: false,
+      nextSequence: 0,
       signal: request.signal,
       abort,
       timer: setTimeout(() => this.onTimeout(id), Math.max(0, expiresAt - Date.now())),
@@ -197,9 +205,6 @@ export class Broker {
   }
 
   private async deliver(delivery: Delivery): Promise<Response> {
-    if (this.delivering.has(delivery.id)) {
-      return apiError(404, "Unknown or already delivered claim.", "claim_not_found");
-    }
     const now = Date.now();
     const job = this.sql.exec<JobRow>(
       `SELECT id, claim_id, expires_at, stream_started, request_json, runtime_id
@@ -221,6 +226,12 @@ export class Broker {
       await this.scheduleAlarm();
       return Response.json({ accepted: true }, { headers: { "Cache-Control": "no-store" } });
     }
+    if (this.delivering.has(delivery.id)) {
+      return apiError(404, "Unknown or already delivered claim.", "claim_not_found");
+    }
+    if (waiter.relay) {
+      return apiError(409, "This claim already has an active SSE stream.", "stream_in_progress");
+    }
     if (waiter.streaming && !("error" in delivery)) {
       return apiError(409, "This claim requires an SSE upload.", "stream_required");
     }
@@ -236,55 +247,145 @@ export class Broker {
 
   private async deliverStream(request: Request): Promise<Response> {
     const claimId = request.headers.get("X-Cadge-Claim-ID");
-    if (!claimId || !request.body) {
-      return apiError(400, "Missing claim ID or SSE upload body.", "invalid_request");
+    const sequenceHeader = request.headers.get("X-Cadge-Stream-Sequence");
+    const endHeader = request.headers.get("X-Cadge-Stream-End");
+    if (!claimId || !UUID.test(claimId) || sequenceHeader === null || !/^\d+$/.test(sequenceHeader)
+      || !Number.isSafeInteger(Number(sequenceHeader)) || (endHeader !== "0" && endHeader !== "1")) {
+      return apiError(400, "Invalid SSE packet headers.", "invalid_delivery");
     }
-    if (this.delivering.has(claimId)) {
-      return apiError(404, "Unknown or already delivered claim.", "claim_not_found");
-    }
+    const sequence = Number(sequenceHeader);
+    const final = endHeader === "1";
     const now = Date.now();
     const job = this.sql.exec<JobRow>(
       `SELECT id, claim_id, expires_at, stream_started, request_json, runtime_id
        FROM jobs WHERE claim_id = ?`, claimId,
     ).toArray()[0];
-    let waiter = job ? this.waiters.get(job.id) : undefined;
+    const waiter = job ? this.waiters.get(job.id) : undefined;
     if (!job) {
       const expired = this.sql.exec<{ claim_id: string }>(
-        `SELECT claim_id FROM expired_claims WHERE claim_id = ? AND purge_at > ?`,
-        claimId, now,
+        `SELECT claim_id FROM expired_claims WHERE claim_id = ? AND purge_at > ?`, claimId, now,
       ).toArray()[0];
-      if (!expired) {
-        return apiError(404, "Unknown or already delivered claim.", "claim_not_found");
-      }
-    } else if ((!job.stream_started && job.expires_at <= now) || !waiter || waiter.signal.aborted) {
+      if (!expired) return apiError(404, "Unknown or already delivered claim.", "claim_not_found");
+      return this.discardPacket(request);
+    }
+    if ((!job.stream_started && job.expires_at <= now) || !waiter || waiter.signal.aborted) {
       this.expire(job.id, this.timeoutResponse());
-      waiter = undefined;
-    } else if (!waiter.streaming) {
+      await this.scheduleAlarm();
+      return this.discardPacket(request);
+    }
+    if (!waiter.streaming) {
       return apiError(409, "This claim did not request streaming.", "stream_not_requested");
     }
-
-    // Reserve before yielding, including discarded uploads. Cancellation removes
-    // the SQL job, but this reservation rejects duplicates until the upload ends.
-    this.delivering.add(claimId);
-    let relay: StreamRelay | undefined;
-    if (waiter && job) {
-      const downstream = this.createRelay(job.id);
-      relay = downstream.relay;
-      waiter.relay = relay;
-      // Keep the waiter, deadline and request correlation for the body lifetime.
-      waiter.resolve(new Response(downstream.body, {
-        headers: {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-store",
-          "X-Accel-Buffering": "no",
-        },
-      }));
+    if (this.delivering.has(claimId)) {
+      return apiError(409, "Another packet is being delivered for this claim.", "stream_packet_in_progress");
     }
-    const upload = this.pumpUpload(request.body, claimId, job?.id, relay);
-    // Client cancellation must not cancel the producer: continue reading to EOF.
+    if (sequence !== waiter.nextSequence) {
+      return apiError(409, "The stream packet sequence is not the next expected sequence.", "stream_sequence_mismatch");
+    }
+    // Reserve only this packet. No second packet or JSON delivery can race its read or relay push.
+    this.delivering.add(claimId);
+    const upload = (async () => {
+      try {
+        const bytes = await this.readPacket(request.body);
+        if (request.signal.aborted) throw new Error("The packet transport disconnected.");
+        // Cancellation or the initial deadline may have won while reading the packet.
+        if (this.waiters.get(job.id) !== waiter) return;
+        if (!waiter.streamStarted && waiter.expiresAt <= Date.now()) {
+          this.expire(job.id, this.timeoutResponse());
+          return;
+        }
+        if (!final && bytes.byteLength === 0) {
+          throw new PacketError(400, "A nonfinal SSE packet must not be empty.");
+        }
+        if (bytes.byteLength > 0) this.startStream(job.id);
+        if (this.waiters.get(job.id) !== waiter) return;
+        if (!waiter.relay) {
+          const downstream = this.createRelay(job.id);
+          waiter.relay = downstream.relay;
+          waiter.resolve(new Response(downstream.body, {
+            headers: {
+              "Content-Type": "text/event-stream; charset=utf-8",
+              "Cache-Control": "no-store",
+              "X-Accel-Buffering": "no",
+            },
+          }));
+        }
+        if (bytes.byteLength > 0) await waiter.relay.push(bytes);
+        if (this.waiters.get(job.id) !== waiter) return;
+        if (final) {
+          waiter.relay.close();
+          this.sql.exec("DELETE FROM jobs WHERE id = ?", job.id);
+          this.detachWaiter(job.id);
+        } else {
+          waiter.nextSequence++;
+        }
+      } catch (error) {
+        if (!(error instanceof PacketError) && this.waiters.get(job.id) === waiter) {
+          waiter.relay?.stop(new Error("The agent stream upload failed."), "agent_stream_error");
+          this.sql.exec("DELETE FROM jobs WHERE id = ?", job.id);
+          this.settle(job.id, apiError(502, "The agent stream upload failed.", "agent_stream_error"));
+        }
+        throw error;
+      } finally {
+        this.delivering.delete(claimId);
+        await this.scheduleAlarm();
+      }
+    })();
+    // A caller disconnect must not interrupt draining the producer's finite packet.
     this.state.waitUntil(upload.catch(() => {}));
     try {
       await upload;
+      return Response.json({ accepted: true }, { headers: { "Cache-Control": "no-store" } });
+    } catch (error) {
+      if (error instanceof PacketError) return apiError(error.status, error.message, "invalid_delivery");
+      return apiError(502, "The agent stream upload failed.", "agent_stream_error");
+    }
+  }
+
+  private async readPacket(body: ReadableStream<Uint8Array> | null): Promise<Uint8Array> {
+    if (!body) return new Uint8Array(0);
+    const reader = body.getReader();
+    let bytes: Uint8Array | undefined;
+    let length = 0;
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) return bytes
+          ? (bytes.byteLength === length ? bytes : bytes.subarray(0, length))
+          : new Uint8Array(0);
+        if (chunk.value.byteLength === 0) continue;
+        if (chunk.value.byteLength > MAX_PACKET_BYTES - length) {
+          // Do not retain an oversized upload or wait for its producer to reach EOF.
+          void reader.cancel().catch(() => {});
+          throw new PacketError(413, "SSE packets must not exceed 65536 bytes.");
+        }
+        if (!bytes) {
+          bytes = chunk.value;
+        } else {
+          if (bytes.byteLength < MAX_PACKET_BYTES) {
+            const joined = new Uint8Array(MAX_PACKET_BYTES);
+            joined.set(bytes);
+            bytes = joined;
+          }
+          bytes.set(chunk.value, length);
+        }
+        length += chunk.value.byteLength;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  private async discardPacket(request: Request): Promise<Response> {
+    const drain = (async () => {
+      const reader = request.body?.getReader();
+      if (!reader) return;
+      try { while (!(await reader.read()).done) { /* Discard without buffering. */ } }
+      finally { reader.releaseLock(); }
+    })();
+    this.state.waitUntil(drain.catch(() => {}));
+    try {
+      await drain;
       return Response.json({ accepted: true }, { headers: { "Cache-Control": "no-store" } });
     } catch {
       return apiError(502, "The agent stream upload failed.", "agent_stream_error");
@@ -325,48 +426,18 @@ export class Broker {
         // Release forwarding, then expose failure as SSE: HTTP proxies may turn
         // controller.error() into an indistinguishable clean EOF.
         ready.resolve();
-        controller.enqueue(new TextEncoder().encode(`\n\ndata: ${JSON.stringify({ error: {
-          message: error.message, type: "server_error", param: null, code,
-        } })}\n\n`));
-        controller.close();
+        try {
+          controller.enqueue(new TextEncoder().encode(`\n\ndata: ${JSON.stringify({ error: {
+            message: error.message, type: "server_error", param: null, code,
+          } })}\n\n`));
+          controller.close();
+        } catch {
+          // A broken relay must not prevent detaching its waiter and SQL job.
+          controller.error(error);
+        }
       },
     };
     return { body, relay };
-  }
-
-  private async pumpUpload(
-    body: ReadableStream<Uint8Array>,
-    claimId: string,
-    jobId: number | undefined,
-    relay: StreamRelay | undefined,
-  ): Promise<void> {
-    const reader = body.getReader();
-    let firstChunk = true;
-    try {
-      for (;;) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        if (chunk.value.byteLength === 0) continue;
-        if (firstChunk) {
-          firstChunk = false;
-          if (jobId !== undefined && relay) this.startStream(jobId);
-        }
-        // One input chunk at a time; no JSON parsing, decoding or accumulation.
-        if (relay) await relay.push(chunk.value);
-      }
-      relay?.close();
-    } catch (error) {
-      relay?.stop(new Error("The agent stream upload failed."), "agent_stream_error");
-      throw error;
-    } finally {
-      reader.releaseLock();
-      if (jobId !== undefined) {
-        this.sql.exec("DELETE FROM jobs WHERE id = ?", jobId);
-        this.detachWaiter(jobId);
-      }
-      this.delivering.delete(claimId);
-      await this.scheduleAlarm();
-    }
   }
 
   private startStream(id: number): void {
@@ -400,6 +471,7 @@ export class Broker {
         "SELECT claim_id FROM jobs WHERE id = ?", id,
       ).toArray()[0];
       if (job?.claim_id) {
+        this.delivering.delete(job.claim_id);
         this.sql.exec(
           "INSERT OR IGNORE INTO expired_claims (claim_id, purge_at) VALUES (?, ?)",
           job.claim_id, Date.now() + TOMBSTONE_RETENTION_MS,
