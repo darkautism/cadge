@@ -1,0 +1,3 @@
+# Local development only. Use distinct random secrets in production.
+CLIENT_TOKEN="local-client-token-change-before-deploy"
+AGENT_TOKEN="local-agent-token-change-before-deploy"

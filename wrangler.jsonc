@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cadge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-30",
+  "durable_objects": {
+    "bindings": [{ "name": "BROKER", "class_name": "Broker" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Broker"] }],
+  "vars": {
+    "MODEL_ID": "cadge",
+    "REQUEST_TIMEOUT_MS": "120000"
+  }
+}
