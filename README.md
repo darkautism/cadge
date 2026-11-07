@@ -21,7 +21,7 @@ npm run check
 npm test
 ```
 
-`npm test` 先打包 Worker，再用 Miniflare/workerd 的 SQLite Durable Object 執行 HTTP 整合測試，包括競爭領取、交付對應、權限、逾時與 SSE。
+`npm test` 先打包 Worker，再用 Miniflare/workerd 的 SQLite Durable Object 執行 HTTP 整合測試，包括競爭領取、交付對應、權限、取消、逾時，以及 Agent 上傳尚未結束時 Client 就收到首段 SSE 的即時轉送驗證。
 
 ## API
 
@@ -32,7 +32,7 @@ npm test
 | `GET /v1/models` | `CLIENT_TOKEN` | 列出設定的模型識別字 |
 | `POST /v1/chat/completions` | `CLIENT_TOKEN` | 入列並等待 Agent 交付 |
 | `POST /beg` | `AGENT_TOKEN` | 原子領取最早尚未被領取、未逾時的工作 |
-| `POST /deliver` | `AGENT_TOKEN` | 用領取 UUID 交付結果或處理失敗訊息 |
+| `POST /deliver` | `AGENT_TOKEN` | 用領取 UUID 交付完整 JSON、即時 SSE 或處理失敗訊息 |
 
 ### 1. Client 提問
 
@@ -43,7 +43,7 @@ curl http://localhost:8787/v1/chat/completions \
   -d '{"model":"cadge","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-這個連線會等待交付，預設最多 120 秒。既有 OpenAI Chat provider 設定 `base_url=https://<worker-host>/v1`、API key 為 `CLIENT_TOKEN`、model 為 `MODEL_ID`；呼叫端的 timeout 需要比 Cadge 等待時間長。
+這個連線會等待交付，預設最多 120 秒，包含佇列等待及完整串流時間。既有 OpenAI Chat provider 設定 `base_url=https://<worker-host>/v1`、API key 為 `CLIENT_TOKEN`、model 為 `MODEL_ID`；呼叫端的 timeout 需要比 Cadge deadline 長。即時串流請在 body 加上 `"stream":true`；用 curl 觀察時加 `-N`，避免終端輸出被 curl 緩衝。
 
 ### 2. Agent 乞討
 
@@ -72,11 +72,13 @@ curl -i http://localhost:8787/beg \
 - 沒工作回 `204 No Content`，無 body，附 `Retry-After: 5`。Agent 必須自行實作等待；此值只是提示，不是伺服器限流。
 - SQL 單一 `UPDATE … RETURNING` 完成選取與領取，同一筆工作不會被兩次成功領取。
 
-Agent 可以自行選擇如何取得答案。如果轉送至真正的 OpenAI provider，應將模型識別字映射成該 provider 的模型，並用 `stream: false`（移除 `stream_options`）取得完整 completion 後交付；不要把上游 SSE 文字當 completion JSON。
+Agent 可以自行選擇如何取得答案。如果轉送至真正的 OpenAI provider，應自行映射模型識別字，並依 `job.request.stream` 選擇模式：非串流交付完整 completion；`stream: true` 則立即轉送上游原始 OpenAI SSE，不要先收集整份結果，也不要把 SSE 文字當 completion JSON。
 
 ### 3. Agent 交付
 
-將上一步取得的 `id` 放入 body：
+#### 非串流交付
+
+適用於 `job.request.stream` 為 `false` 或省略的工作。將上一步取得的 `id` 放入 body：
 
 ```sh
 curl http://localhost:8787/deliver \
@@ -99,7 +101,28 @@ curl http://localhost:8787/deliver \
   }'
 ```
 
-成功回 `200 {"accepted":true}`；原始 Client 收到完整的 `response`，不加 Cadge 外層包裝。`response` 與 `error` 只能提供其中一個。
+交付回 `200 {"accepted":true}`，代表已收件，不保證原始 Client 仍在等待。Client 仍等待時，收到完整 `response`，不加 Cadge 外層包裝；Client 已取消／請求已結束時，結果直接丟棄，不保存，也不向 Agent 揭露取消狀態。`response` 與 `error` 只能提供其中一個。
+
+#### 即時串流交付
+
+`job.request.stream === true` 時，使用同一個 `/deliver`，但改送 **raw OpenAI SSE**；UUID 放在 `X-Cadge-Claim-ID`，不加 JSON 外層：
+
+```sh
+curl http://localhost:8787/deliver \
+  -X POST \
+  -H 'Authorization: Bearer local-agent-token-change-before-deploy' \
+  -H 'Content-Type: text/event-stream' \
+  -H 'X-Cadge-Claim-ID: 727bb93b-9a25-4754-a1ec-12c2a9cc89ad' \
+  --upload-file - < response.sse
+```
+
+上例重播 SSE 檔案；即時使用時，將自己的 SSE producer 接到 curl 的 stdin。`--upload-file -` 會邊讀邊上傳；不要使用會先讀完整份 stdin 的 `--data-binary @-`。也可直接使用下方的 `deliver.mjs --stream` 或 polling adapter。
+
+Cadge 收到資料就轉送給原始 Client，**不等 Agent 上傳結束**；使用下游背壓限制記憶體，不累積完整答案。SSE 註解、UTF-8、文字／tool call chunks、usage 與 `[DONE]` 均原樣傳遞。Cadge 不解析或補造正常 SSE 內容；Agent 必須產生有效的 OpenAI SSE。
+
+Agent 的上傳讀到 EOF 後才回 `200 {"accepted":true}`。Client 中途離開時停止轉送，但持續讀取並丟棄 Agent 剩餘串流，最後仍回相同收件成功，不中斷或通知 Agent。
+
+#### 處理失敗
 
 Agent 處理失敗也必須交付，讓 Client 不必等到逾時：
 
@@ -110,7 +133,7 @@ Agent 處理失敗也必須交付，讓 Client 不必等到逾時：
 }
 ```
 
-此時 Agent 收到交付成功，Client 收到 OpenAI 形狀的 `502`、`error.code=agent_error`。
+串流尚未開始前，兩種模式都能交付上述 JSON error：Agent 收到交付成功；若 Client 仍在等待，收到 OpenAI 形狀的 `502`、`error.code=agent_error`。若 Client 已取消或請求已結束，則只收件並丟棄。串流已開始後不能再對同一 UUID 交付 JSON error，應在原 SSE 中回報錯誤並結束，不可補造成功答案或 `[DONE]`。
 
 ### 錯誤與生命週期
 
@@ -118,28 +141,45 @@ Agent 處理失敗也必須交付，讓 Client 不必等到逾時：
 |---|---:|
 | Token 缺少、錯誤或角色不符 | 401 |
 | JSON 或請求／交付基本格式錯誤 | 400 |
-| 未知模型、未知 UUID、已成功交付的 UUID | 404 |
-| 已逾時或呼叫者已不再等待的 UUID，保留期間內 | 410 |
-| Body 超過 256 KiB | 413 |
+| 未知模型、未知 UUID、正在／已成功交付的 UUID | 404 |
+| 已取消／逾時的已領取 UUID，仍在識別碼保留期間內 | Agent 200，正常收件回應，結果丟棄 |
+| JSON 成功交付給串流工作／SSE 交付給非串流工作 | 409，`stream_required`／`stream_not_requested`，不消耗領取 UUID |
+| JSON body 超過 256 KiB | 413 |
 | Agent 回報失敗 | Client 502 |
 | 缺少／重複 secrets、設定錯誤或協調器中斷 | 503 |
-| 等待 Agent 逾時 | Client 504 |
+| 尚未開始回傳 SSE 就到期 | Client 504 |
+| SSE 已開始後到期／Agent 上傳中斷 | Client SSE error，`request_timeout`／`agent_stream_error`，不補 `[DONE]` |
 
-請求 body 上限也適用交付，依實際 UTF-8 位元組數檢查，不依賴 `Content-Length`。大型圖片請使用 URL，而不是大型 base64 body。
+256 KiB 上限適用 Client JSON 請求與 JSON 交付，依實際 UTF-8 位元組數檢查，不依賴 `Content-Length`。raw SSE 交付沒有此總長度上限，也不會先讀完整份串流。大型圖片請使用 URL，而不是大型 base64 請求 body。
 
-待辦請求保存在 SQLite；交付或到期時刪除 prompt，不保存結果。逾時的已領取 UUID 僅保留約 5 分鐘的無內容標記以回 `410`，超過保留期回 `404`，並由 alarm 批次清理。
+待辦請求保存在 SQLite；交付、取消或到期時刪除 prompt，不保存結果。取消／逾時的已領取 UUID 僅保留約 5 分鐘的無內容標記，期間內晚到的有效交付仍回 `200 {"accepted":true}`，不回傳 `discarded` 等額外欄位。超過識別碼保留期則視為未知 UUID、回 `404`；標記由 alarm 批次清理。
 
-**不自動重新派工。** Agent 領取後失聯，原始請求在 deadline 時回 `504`。交付只接受一次，但這不等於外部模型推理 exactly-once：若領取回應在網路途中遺失，該工作仍已領取。
+**不自動重新派工。** Agent 領取後失聯，尚未開始回應的原始請求在 deadline 時回 `504`；已開始的 SSE 以錯誤事件結束，HTTP 狀態無法再更改。同一份仍有效的請求只會轉交一次，但這不等於外部模型推理 exactly-once：若領取回應在網路途中遺失，該工作仍已領取。對已結束工作的正常收件回應不代表重新轉交。
 
-HTTP 連線與記憶體中的等待者不能跨 runtime 重啟還原。重啟時清除無法再交付的前一個 runtime 工作；Client 可能收到連線錯誤或 `503`。主動斷線在 runtime 有傳遞 abort 時會提前清理，否則等到 deadline。此 API 沒有非同步結果查詢或跨連線恢復。
+HTTP 連線與記憶體中的等待者不能跨 runtime 重啟還原。重啟時清除無法再交付的前一個 runtime 工作；Client 可能收到連線錯誤或 `503`。此 API 沒有非同步結果查詢或跨連線恢復。
+
+### Client 取消／不再等待
+
+此處 Client 指呼叫 `/v1/chat/completions` 的原始提問者，不是 polling 的 Agent。收到 Cloudflare 的請求取消通知後：
+
+- **Agent 還沒領取**：刪除該筆乞討與 prompt，移除等待者及計時器，後續 `/beg` 不會再拿到它。
+- **Agent 已領取**：同樣刪除服務端工作與 prompt，但不嘗試中斷外部 Agent。Agent 後續交付時，在識別碼保留期間內正常回 `200 {"accepted":true}`；內容直接丟棄、不保存、不轉交，也不告訴 Agent Client 已放棄。
+- **已開始串流**：停止往 Client 轉送，解除下游背壓，繼續接收並丟棄 Agent 上傳直到 EOF，再正常回覆收件成功；不因 Client 取消而取消 Agent 的上傳。
+- **取消比入列更早到**：內部請求 UUID 與 deadline 防止取消後又被延遲的入列請求建立成新工作；這不是公開的取消 API，外部不能指定內部 UUID。
+
+`wrangler.jsonc` 已顯式啟用 `enable_request_signal`。入口收到 abort 後，以 `ctx.waitUntil` 發出不帶已取消 signal 的內部取消通知，確保 Durable Object 執行清理；不只依賴跨服務轉傳 AbortSignal。
+
+**停止等待不一定等於取消 HTTP。** Client 端若只做 `Promise.race`／忽略回應，卻沒有 abort／close 實際連線，伺服器無從知道；網路中斷、代理或 runtime 也可能延遲／沒有傳遞取消通知。這些情況仍由 `REQUEST_TIMEOUT_MS`（預設 120 秒）清理，不能承諾所有 `Ctrl-C` 都在固定毫秒內被偵測。
+
+本機的 Wrangler／Miniflare 代理不一定轉傳斷線事件。取消回歸測試直接連 workerd socket，以真實 TCP reset 驗證；普通 TCP FIN 是半關閉，可能要等後續寫入才偵測到。正式環境的代理／Client 取消行為仍需在自己的部署驗證。
 
 ### OpenAI 相容範圍
 
 支援 `/v1/models` 與 `/v1/chat/completions`，不是 OpenAI 全部 API；未實作 Responses、Embeddings、檔案及模型管理。
 
 - 非串流：轉交完整 completion，保留額外回應欄位。
-- `stream: true`：等待完整交付後，以 `chat.completion.chunk` SSE 回傳內容、tool calls、finish reason 與 `[DONE]`；**不是即時逐 token 生成**。
-- `stream_options.include_usage: true`：若 Agent 提供 usage，增加 usage chunk。
+- `stream: true`：Agent 上傳 raw OpenAI SSE，Cadge 立即逐段 relay，不等完整答案，也不將完整 JSON 轉成模擬串流。
+- `stream_options.include_usage: true`：保留在原始工作中；由 Agent 產生 usage SSE，Cadge 原樣轉送，不自行計算或補上 usage。
 - 等待過程不發送 SSE heartbeat；Client、代理或其他上游需容許設定的等待時間。
 
 ## Agent hooks
@@ -175,9 +215,12 @@ Agent 要保留 `id`，讀取 `request.messages` 與其他模型參數，再於 
 ./scripts/deliver.mjs "$CADGE_JOB_ID" < completion.json
 # 處理失敗時，交付錯誤而不是捏造答案
 ./scripts/deliver.mjs "$CADGE_JOB_ID" --error 'Agent 無法完成此次請求。'
+# stream:true 的工作：raw SSE 檔案，或由 stdin 持續輸入 SSE
+./scripts/deliver.mjs "$CADGE_JOB_ID" --stream response.sse
+./scripts/deliver.mjs "$CADGE_JOB_ID" --stream < response.sse
 ```
 
-三行是**替代用法，不是依序執行**；每份工作只能交付一次。成功 stdout 為 `{"accepted":true}`，錯誤 exit code 非零。檔案／stdin 內容是 `chat.completion` 物件本身，不要再包 `{id,response}`；hook 會處理外層包裝。不要把 SSE、純文字或 Agent 工具自己的 JSON envelope 直接交付。
+以上為**替代用法，不是依序執行**；每份工作只能開始一次有效交付。成功 stdout 為 `{"accepted":true}`，串流需等到 stdin／檔案 EOF 及伺服器收件成功才輸出；錯誤 exit code 非零。JSON 模式輸入 `chat.completion` 物件本身，不要再包 `{id,response}`；`--stream [sse-file|-]` 則輸入 raw OpenAI SSE，省略來源或 `-` 都讀 stdin。不要輸入純文字或 Agent 工具自己的 JSON envelope；hook 不驗證 SSE 內容。
 
 ### 持續 polling 並呼叫自己的 Agent
 
@@ -189,14 +232,14 @@ CADGE_POLL_INTERVAL_MS=10000 ./scripts/poll.mjs -- ./my-agent
 
 `./my-agent` 是**你現有的 Agent／adapter 執行檔**，不是 repo 內附的模型程式。呼叫方式也可以是 `-- node /absolute/path/to/agent.mjs`，或任何符合下列介面的 executable 與參數：
 
-- stdin：原始 `job.request` JSON，所有欄位保留。若呼叫真正的 OpenAI provider，adapter 自行映射模型並改用非串流請求取得完整回應。
-- stdout：恰好一個完整 `chat.completion` JSON；log 請寫到 stderr。
+- stdin：原始 `job.request` JSON 加換行，所有欄位保留；adapter 自行映射真正 provider 的模型，並遵守原始 `stream` 模式。
+- stdout：`stream: true` 時為 raw OpenAI SSE，poller 立即以背壓上傳，不收集或重新編碼；其他工作為恰好一個完整 `chat.completion` JSON。log 一律寫到 stderr。
 - 環境變數：額外提供 `CADGE_JOB_ID` 與毫秒單位的 `CADGE_EXPIRES_AT`。
 - 成功 exit `0`；失敗 exit 非零。adapter 繼承 Agent 環境，請只執行受信任的命令。
 
-poller 預設空等 **5 秒**再領，`CADGE_POLL_INTERVAL_MS=10000` 可改成 10 秒；成功交付後立即領下一筆。它不使用 shell 解譯命令，不會自動重試結果不明的領取／交付。子程式失敗或 stdout 格式錯誤時，交付一次錯誤後非零退出，方便由既有的程序管理器處理。
+poller 預設空等 **5 秒**再領，`CADGE_POLL_INTERVAL_MS=10000` 可改成 10 秒；成功交付後立即領下一筆。它不使用 shell 解譯命令，不會自動重試結果不明的領取／交付。非串流 stdout 格式錯誤或子程式失敗，交付一次 JSON error 後非零退出。串流子程式啟動失敗也走 JSON error；已開始上傳後失敗，則附加 SSE error 事件、完成該次上傳，再非零退出，不另送第二次交付，也不補 `[DONE]`。
 
-`Ctrl-C`／`SIGTERM` 會停止 polling 並終止正在執行的子程式，不會交付假答案；執行超過 job deadline 也會終止。POSIX 系統會終止子程式群組，必要時在 1 秒後強制結束。停止時尚未交付的工作不自動重派，原始 Client 會逾時。
+`Ctrl-C`／`SIGTERM` 會停止 polling 並終止正在執行的子程式，不會交付假答案；執行超過 job deadline 也會終止。POSIX 系統會終止子程式群組，必要時在 1 秒後強制結束。尚未開始交付的工作不自動重派，原始 Client 會逾時；已開始的串流會中斷並回報錯誤。這是 Agent 自身停止的行為，不是 Client 取消時通知 Agent。
 
 
 ## 部署到 Cloudflare
@@ -340,11 +383,11 @@ WAF 保護的是未授權的邊緣流量，不是「保證永不超額」；白�
 | 設定 | 預設值 | 說明 |
 |---|---|---|
 | `MODEL_ID` | `cadge` | 對 Client 公告並接受的模型識別字 |
-| `REQUEST_TIMEOUT_MS` | `120000` | 100–600000 毫秒，含佇列等待時間 |
+| `REQUEST_TIMEOUT_MS` | `120000` | 100–600000 毫秒，含佇列等待及整段串流時間 |
 | `CLIENT_TOKEN` | 無 | Client 用 secret |
 | `AGENT_TOKEN` | 無 | Agent 用 secret，不能與 Client 相同 |
 
-Agent token 是同一受信任群組的共同憑證，沒有個別 Agent 身分或 per-client 佇列隔離。所有獲授權 Agent 都可能領到使用者完整 prompt；UUID 是群組內的交付能力憑證，不是逐 Agent 的權限綁定。不要將 Agent token 發給不能信任的對象。本服務驗證交付格式，不驗證答案正確性。
+Agent token 是同一受信任群組的共同憑證，沒有個別 Agent 身分或 per-client 佇列隔離。所有獲授權 Agent 都可能領到使用者完整 prompt；UUID 是群組內的交付能力憑證，不是逐 Agent 的權限綁定。不要將 Agent token 發給不能信任的對象。本服務驗證 JSON 交付結構與 SSE 交付標頭，不驗證答案正確性或 SSE event 內容。
 
 ## 免費層可行性與 polling 成本
 

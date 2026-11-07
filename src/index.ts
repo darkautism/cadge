@@ -1,5 +1,4 @@
 import { apiError, isObject, type ChatRequest, type Completion, type Env, type JsonObject } from "./protocol";
-import { completionStream } from "./stream";
 export { Broker } from "./broker";
 
 const MAX_BODY_BYTES = 256 * 1024;
@@ -66,8 +65,44 @@ function validCompletion(value: unknown): value is Completion {
           && typeof call.function.name === "string" && typeof call.function.arguments === "string"))));
 }
 
+function forwardStream(response: Response, cancel: () => void, detach: () => void): Response {
+  const reader = response.body!.getReader();
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    detach();
+  };
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const chunk = await reader.read();
+        if (finished) return;
+        if (chunk.done) {
+          reader.releaseLock();
+          finish();
+          controller.close();
+        } else controller.enqueue(chunk.value);
+      } catch (error) {
+        if (!finished) {
+          reader.releaseLock();
+          finish();
+          controller.error(error);
+        }
+      }
+    },
+    async cancel(reason) {
+      cancel();
+      finish();
+      try { await reader.cancel(reason); }
+      finally { reader.releaseLock(); }
+    },
+  });
+  return new Response(body, { status: response.status, headers: response.headers });
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
     const clientRoute = path === "/v1/models" || path === "/v1/chat/completions";
     const agentRoute = path === "/beg" || path === "/deliver";
@@ -96,14 +131,22 @@ export default {
         { id: env.MODEL_ID, object: "model", created: 0, owned_by: "cadge" },
       ] }, { headers: { "Cache-Control": "no-store" } });
     }
+    let detachAbort: (() => void) | undefined;
+    let notifyCancel: (() => void) | undefined;
     try {
       let body: JsonObject | undefined;
-      if (path !== "/beg") body = await readJson(request);
+      const streamDelivery = path === "/deliver"
+        && request.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase() === "text/event-stream";
+      if (path !== "/beg" && !streamDelivery) body = await readJson(request);
+      const claimId = streamDelivery ? request.headers.get("X-Cadge-Claim-ID") : null;
+      if (streamDelivery && (!claimId || !UUID.test(claimId) || !request.body)) {
+        return apiError(400, "SSE delivery requires a claim UUID in X-Cadge-Claim-ID and a request body.", "invalid_delivery");
+      }
       if (path === "/v1/chat/completions") {
         if (!validChat(body!)) return apiError(400, "Provide model, nonempty messages, and an optional boolean stream.", "invalid_request");
         if (body!.model !== env.MODEL_ID) return apiError(404, "The requested model is not available.", "model_not_found");
       }
-      if (path === "/deliver") {
+      if (path === "/deliver" && !streamDelivery) {
         const hasResponse = Object.hasOwn(body!, "response");
         const hasError = Object.hasOwn(body!, "error");
         if (typeof body!.id !== "string" || !UUID.test(body!.id)
@@ -113,22 +156,61 @@ export default {
           return apiError(400, "Provide a claim UUID and either a full chat.completion response or error.message.", "invalid_delivery");
         }
       }
-      // Never forward public Authorization headers or tokens into the queue.
+      // Never forward public Authorization headers, tokens, or correlation IDs into the queue.
+      const broker = env.BROKER.get(env.BROKER.idFromName("cadge"));
+      const headers = new Headers({ "Content-Type": streamDelivery ? "text/event-stream; charset=utf-8" : "application/json" });
+      if (claimId) headers.set("X-Cadge-Claim-ID", claimId);
+      if (path === "/v1/chat/completions") {
+        const requestId = crypto.randomUUID();
+        const deadline = Date.now() + timeout;
+        headers.set("X-Cadge-Request-ID", requestId);
+        headers.set("X-Cadge-Request-Deadline", String(deadline));
+        let notified = false;
+        const abort = () => {
+          if (notified) return;
+          notified = true;
+          // Cleanup must outlive the disconnected caller and must not inherit its signal.
+          ctx.waitUntil(broker.fetch(new Request("https://broker/cancel", {
+            method: "POST",
+            headers: {
+              "X-Cadge-Request-ID": requestId,
+              "X-Cadge-Request-Deadline": String(deadline),
+            },
+          })).then(() => undefined));
+        };
+        notifyCancel = abort;
+        request.signal.addEventListener("abort", abort, { once: true });
+        detachAbort = () => request.signal.removeEventListener("abort", abort);
+        // Body parsing may already have observed the caller disconnecting.
+        if (request.signal.aborted) return apiError(499, "The caller disconnected.", "request_cancelled");
+      }
       const internal = new Request(`https://broker${path}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body),
+        headers,
+        body: streamDelivery ? request.body : body === undefined ? undefined : JSON.stringify(body),
         signal: request.signal,
       });
-      const response = await env.BROKER.get(env.BROKER.idFromName("cadge")).fetch(internal);
-      if (path === "/v1/chat/completions" && body!.stream === true && response.ok) {
-        const includeUsage = isObject(body!.stream_options) && body!.stream_options.include_usage === true;
-        return completionStream(await response.json<Completion>(), includeUsage);
+      const pending = broker.fetch(internal);
+      if (path === "/v1/chat/completions") {
+        // Keep the enqueue lifecycle alive if the client disconnects while it
+        // races cancellation. The awaited branch below handles fetch failures.
+        ctx.waitUntil(pending.then(() => undefined, () => undefined));
+      }
+      const response = await pending;
+      if (path === "/v1/chat/completions" && response.ok && response.body
+        && response.headers.get("Content-Type")?.startsWith("text/event-stream")) {
+        const streamed = forwardStream(response, notifyCancel!, detachAbort!);
+        // Cancellation remains attached until the response body ends or is canceled.
+        detachAbort = undefined;
+        return streamed;
       }
       return response;
     } catch (error) {
+      if (request.signal.aborted) return apiError(499, "The caller disconnected.", "request_cancelled");
       if (error instanceof BodyError) return apiError(error.status, error.message, "invalid_request");
       return apiError(503, "The coordinator is unavailable; the request may have been interrupted.", "broker_unavailable");
+    } finally {
+      detachAbort?.();
     }
   },
 } satisfies ExportedHandler<Env>;

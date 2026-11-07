@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
-import { beg, deliver, loadConfig, parseJson, reportError, validateCompletion } from "./lib.mjs";
+import { beg, deliver, deliverStream, loadConfig, parseJson, reportError, validateCompletion } from "./lib.mjs";
 
 const MAX_TIMER_MS = 2_147_483_647;
 const KILL_GRACE_MS = 1_000;
@@ -11,9 +11,11 @@ const HELP = `Usage: node scripts/poll.mjs -- command [args...]
 Poll /beg repeatedly and run the supplied trusted executable once per job,
 without a shell. Write the full original job.request JSON plus a newline to
 its stdin. All request fields (including stream) are preserved. The command
-must read that request and emit exactly one full non-streaming OpenAI
-chat.completion JSON object on stdout; send logs to stderr, which is forwarded.
-No model, provider, or inference implementation is supplied by these hooks.
+must read that request. For stream:true, stdout must be raw OpenAI SSE and is
+uploaded immediately, byte-for-byte with backpressure. Otherwise stdout must
+be exactly one full non-streaming OpenAI chat.completion JSON object. Send logs
+to stderr, which is forwarded. No model, provider, or inference implementation
+is supplied by these hooks.
 
 The child inherits the environment, with CADGE_JOB_ID set to the claim UUID
 and CADGE_EXPIRES_AT set to the Unix deadline in milliseconds. It is terminated
@@ -21,11 +23,15 @@ at that deadline. SIGINT/SIGTERM stop polling and terminate the current child;
 termination escalates to SIGKILL after 1 second (including the process group
 on POSIX). Stopping does not submit a result or start another command.
 
-Valid stdout is delivered as {id, response}. Child failure or invalid stdout
-is delivered as {id, error: {message}}, then this process exits nonzero. After
-a successful completion delivery, poll again immediately. After HTTP 204,
-wait CADGE_POLL_INTERVAL_MS. Network/delivery errors exit without retrying an
-ambiguous claim or delivery. The poller itself produces no success stdout.
+Non-streaming stdout is delivered as {id, response}; child failure or invalid
+JSON stdout is delivered as {id, error: {message}}. For streaming jobs, startup
+failure is delivered as JSON error before an upload starts. Failure after the
+upload starts appends an SSE error event, finishes that upload, then exits
+nonzero; there is no second delivery or fabricated answer/[DONE]. Streaming
+stdout is not parsed or validated as SSE. After a successful delivery, poll
+again immediately. After HTTP 204, wait CADGE_POLL_INTERVAL_MS. Network/delivery
+errors exit without retrying an ambiguous claim or delivery. The poller itself
+produces no success stdout.
 
 Required environment:
   CADGE_URL               Service origin, without /v1 or any other path.
@@ -36,13 +42,14 @@ Optional environment:
                           For example, 10000 polls every ten seconds when idle.
 `;
 
-function runCommand(command, args, job, stopSignal) {
+function runCommand(config, command, args, job, stopSignal) {
   if (stopSignal.aborted) return Promise.resolve(null);
   if (Date.now() >= job.expires_at) {
     return Promise.resolve({ error: { message: "The job expired before the agent command could start." } });
   }
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     const processGroup = process.platform !== "win32";
+    const streaming = job.request.stream === true;
     let child;
     try {
       child = spawn(command, args, {
@@ -61,10 +68,13 @@ function runCommand(command, args, job, stopSignal) {
     }
     let closed = false;
     let terminating = false;
+    let streamingStarted = false;
     let failure;
     let deadlineTimer;
     let killTimer;
-    const chunks = [];
+    const chunks = streaming ? null : [];
+    let finishChild;
+    const childFinished = new Promise(finish => { finishChild = finish; });
 
     function kill(signal) {
       try {
@@ -101,8 +111,39 @@ function runCommand(command, args, job, stopSignal) {
       terminate();
     }
 
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", chunk => chunks.push(chunk));
+    async function* streamOutput() {
+      try {
+        for await (const chunk of child.stdout) yield chunk;
+      } catch {
+        failure ??= "Could not read the agent command's stdout.";
+        terminate();
+      }
+      const result = await childFinished;
+      if (!stopSignal.aborted && result.error) {
+        // Separate the error event even if the failed producer left a partial frame.
+        yield Buffer.from(`\n\nevent: error\ndata: ${JSON.stringify({ error: result.error })}\n\n`);
+      }
+    }
+
+    if (streaming) {
+      child.once("spawn", () => {
+        if (stopSignal.aborted) return;
+        streamingStarted = true;
+        // Starting only after spawn keeps startup errors on the JSON error path.
+        deliverStream(config, job.id, streamOutput(), stopSignal).then(async () => {
+          const result = await childFinished;
+          resolve(stopSignal.aborted ? null : { streamed: true, ...result });
+        }, async error => {
+          terminate();
+          await childFinished;
+          if (stopSignal.aborted) resolve(null);
+          else reject(error);
+        });
+      });
+    } else {
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", chunk => chunks.push(chunk));
+    }
     child.stdout.on("error", () => {
       failure ??= "Could not read the agent command's stdout.";
       terminate();
@@ -113,6 +154,7 @@ function runCommand(command, args, job, stopSignal) {
     });
     child.once("error", () => {
       failure ??= "Could not start or communicate with the agent command.";
+      terminate();
     });
     child.once("close", (code, signal) => {
       closed = true;
@@ -120,17 +162,20 @@ function runCommand(command, args, job, stopSignal) {
       clearTimeout(killTimer);
       if (terminating && processGroup) kill("SIGKILL");
       stopSignal.removeEventListener("abort", stop);
-      if (stopSignal.aborted) {
-        resolve(null);
-        return;
-      }
       if (!failure && code !== 0) {
         failure = signal
           ? `The agent command was terminated by ${signal}.`
           : `The agent command exited with code ${code}.`;
       }
+      const result = failure ? { error: { message: failure } } : {};
+      finishChild(result);
+      if (streamingStarted) return;
+      if (stopSignal.aborted) {
+        resolve(null);
+        return;
+      }
       if (failure) {
-        resolve({ error: { message: failure } });
+        resolve(result);
         return;
       }
       try {
@@ -183,9 +228,9 @@ async function main() {
         await idle(interval, stop.signal);
         continue;
       }
-      const result = await runCommand(args[1], args.slice(2), claimed.job, stop.signal);
+      const result = await runCommand(config, args[1], args.slice(2), claimed.job, stop.signal);
       if (stop.signal.aborted || result === null) break;
-      await deliver(config, { id: claimed.job.id, ...result }, stop.signal);
+      if (!result.streamed) await deliver(config, { id: claimed.job.id, ...result }, stop.signal);
       if (result.error) throw new Error(`${result.error.message} The error was delivered to Cadge.`);
     }
   } catch (error) {

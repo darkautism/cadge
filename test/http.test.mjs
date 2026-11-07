@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { request as httpRequest } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -21,17 +22,40 @@ function post(runtime, path, token, body) {
   });
 }
 
-async function createRuntime(t) {
+async function openChatSocket(runtime, label, extra = {}) {
+  // Miniflare's entry proxy does not forward disconnects; target workerd itself.
+  const client = httpRequest(new URL("/v1/chat/completions", await runtime.unsafeGetDirectURL()), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${CLIENT_TOKEN}`, "Content-Type": "application/json" },
+  });
+  client.on("error", () => {}); // Resetting an in-flight HTTP request raises ECONNRESET.
+  const closed = new Promise(resolve => client.once("close", resolve));
+  const response = new Promise(resolve => client.once("response", incoming => {
+    incoming.on("error", () => {}); // Midstream RST also closes the response.
+    resolve(incoming);
+  }));
+  const uploaded = new Promise((resolve, reject) => {
+    client.once("finish", resolve);
+    client.once("error", reject);
+  });
+  client.end(JSON.stringify(chatRequest(label, extra)));
+  await uploaded;
+  return { client, closed, response };
+}
+
+async function createRuntime(t, requestTimeoutMs = REQUEST_TIMEOUT_MS) {
   const runtime = new Miniflare({
     modules: true,
     scriptPath: fileURLToPath(new URL("../dist/index.js", import.meta.url)),
     compatibilityDate: "2026-07-30",
+    compatibilityFlags: ["enable_request_signal"],
+    unsafeDirectSockets: [{ host: "127.0.0.1", port: 0 }],
     durableObjects: { BROKER: { className: "Broker", useSQLite: true } },
     bindings: {
       CLIENT_TOKEN,
       AGENT_TOKEN,
       MODEL_ID: "cadge",
-      REQUEST_TIMEOUT_MS: String(REQUEST_TIMEOUT_MS),
+      REQUEST_TIMEOUT_MS: String(requestTimeoutMs),
     },
   });
   t.after(() => runtime.dispose());
@@ -126,27 +150,82 @@ async function assertApiError(response, status, code) {
   return body;
 }
 
-async function readStream(response) {
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("Content-Type") ?? "", /^text\/event-stream\b/i);
-  const text = await response.text();
-  const events = text
-    .split(/\r?\n\r?\n/)
-    .map((event) => event.split(/\r?\n/)
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trimStart())
-      .join("\n"))
-    .filter(Boolean);
-  assert.ok(events.length > 1, "the stream must contain chunks and a terminator");
-  assert.equal(events.at(-1), "[DONE]");
-  assert.equal(events.filter((event) => event === "[DONE]").length, 1);
-  return events.slice(0, -1).map((event) => {
-    const chunk = JSON.parse(event);
-    assert.equal(chunk.object, "chat.completion.chunk");
-    assert.ok(Array.isArray(chunk.choices));
-    return chunk;
+const encoder = new TextEncoder();
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+async function beginStream(t, runtime, id) {
+  const upload = new TransformStream();
+  const writer = upload.writable.getWriter();
+  const abort = new AbortController();
+  const delivery = fetch(new URL("/deliver", await runtime.unsafeGetDirectURL()), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${AGENT_TOKEN}`,
+      "Content-Type": "text/event-stream",
+      "X-Cadge-Claim-ID": id,
+    },
+    body: upload.readable,
+    duplex: "half",
+    signal: abort.signal,
+  });
+  void delivery.catch(() => {});
+  t.after(() => { abort.abort(); void writer.abort().catch(() => {}); });
+  return {
+    delivery,
+    write: (chunk) => writer.write(typeof chunk === "string" ? encoder.encode(chunk) : chunk),
+    close: () => writer.close(),
+    fail: (error) => writer.abort(error),
+  };
+}
+
+function postStream(runtime, id, body = "data: [DONE]\n\n") {
+  return runtime.dispatchFetch("http://cadge.test/deliver", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${AGENT_TOKEN}`,
+      "Content-Type": "text/event-stream",
+      "X-Cadge-Claim-ID": id,
+    },
+    body,
   });
 }
+
+function assertStreamHeaders(response) {
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("Content-Type") ?? "", /^text\/event-stream;\s*charset=utf-8$/i);
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.equal(response.headers.get("X-Accel-Buffering"), "no");
+}
+
+async function readPrefix(reader, expected) {
+  const chunks = [];
+  let length = 0;
+  while (length < expected.byteLength) {
+    const { done, value } = await reader.read();
+    assert.equal(done, false, "the stream ended before the expected bytes arrived");
+    chunks.push(value);
+    length += value.byteLength;
+  }
+  const actual = Buffer.concat(chunks);
+  assert.deepEqual(actual, Buffer.from(expected));
+  return actual;
+}
+
+async function readRemaining(reader) {
+  const chunks = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return Buffer.concat(chunks);
+    chunks.push(value);
+  }
+}
+
 
 test("client and agent credentials cannot cross-access the HTTP endpoints", { timeout: 30_000 }, async (t) => {
   const runtime = await createRuntime(t);
@@ -216,17 +295,47 @@ test("twelve concurrent agents claim three jobs once and deliveries reach the or
   }), 404);
 });
 
-test("a claimed request times out and its stale capability cannot deliver", { timeout: 30_000 }, async (t) => {
+test("a timed-out claim acknowledges late delivery without reviving the request", { timeout: 30_000 }, async (t) => {
   const runtime = await createRuntime(t);
   const pending = startChat(runtime, chatRequest("expires"));
   const [claim] = await claimRequests(runtime, 1);
 
   await assertApiError(await pending, 504, "request_timeout");
-  await assertApiError(await post(runtime, "/deliver", AGENT_TOKEN, {
+  await assertAccepted(await post(runtime, "/deliver", AGENT_TOKEN, {
     id: claim.id,
     response: completion("too-late"),
-  }), 410);
+  }));
   assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
+});
+
+test("a disconnected HTTP client's late result is acknowledged without exposing cancellation", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 5000);
+  const { client, closed } = await openChatSocket(runtime, "disconnected");
+  const [claim] = await claimRequests(runtime, 1);
+  client.socket.resetAndDestroy();
+  await closed;
+  // Allow the transport close and its cleanup request to cross the DO boundary.
+  await delay(100);
+  const delivered = await post(runtime, "/deliver", AGENT_TOKEN, {
+    id: claim.id, response: completion("must-not-deliver"),
+  });
+  assert.ok(Date.now() < claim.expires_at, "cancellation must work before timeout cleanup");
+  await assertAccepted(delivered);
+  assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
+});
+
+test("an unclaimed request is removed after its HTTP client disconnects", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 5000);
+  const { client, closed } = await openChatSocket(runtime, "cancel-before-claim");
+  const startedAt = Date.now();
+  // The broker is warmed by createRuntime; let the complete upload enqueue.
+  await delay(100);
+  client.socket.resetAndDestroy();
+  await closed;
+  await delay(100);
+  const next = await post(runtime, "/beg", AGENT_TOKEN);
+  assert.ok(Date.now() - startedAt < 5000, "queue removal must not rely on timeout");
+  assert.equal(next.status, 204);
 });
 
 test("an unclaimed request times out instead of remaining available to agents", { timeout: 30_000 }, async (t) => {
@@ -263,81 +372,244 @@ test("simultaneous deliveries consume a claim once and return the winning answer
   assert.deepEqual(await returned.json(), answers[winner]);
 });
 
-test("include_usage emits final totals separately from choice chunks", { timeout: 30_000 }, async (t) => {
-  const runtime = await createRuntime(t);
-  const pending = startChat(runtime, chatRequest("stream-usage", {
-    stream: true, stream_options: { include_usage: true },
-  }));
-  const [claim] = await claimRequests(runtime, 1);
-  const answer = completion("stream-usage");
-  await assertAccepted(await post(runtime, "/deliver", AGENT_TOKEN, { id: claim.id, response: answer }));
-  const chunks = await readStream(await pending);
-  const usageChunks = chunks.filter(chunk => chunk.usage !== null);
-  assert.equal(usageChunks.length, 1);
-  assert.deepEqual(usageChunks[0].usage, answer.usage);
-  assert.deepEqual(usageChunks[0].choices, []);
-  assert.equal(chunks.at(-1), usageChunks[0]);
-});
-
-test("streaming text includes assistant content, the finish reason, and DONE", { timeout: 30_000 }, async (t) => {
-  const runtime = await createRuntime(t);
-  const request = chatRequest("stream-text", { stream: true });
+test("SSE reaches the client before upload EOF and preserves comments, Unicode, tools, usage, and DONE byte-for-byte", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 10_000);
+  const request = chatRequest("stream-exact", { stream: true, stream_options: { include_usage: true } });
   const pending = startChat(runtime, request);
   const [claim] = await claimRequests(runtime, 1);
-  assert.deepEqual(claim.request, request);
-  const answer = completion("stream-text");
-  answer.choices[0].message.content = "An answer with Zürich, 🌊, and a\nsecond line.";
-  await assertAccepted(await post(runtime, "/deliver", AGENT_TOKEN, { id: claim.id, response: answer }));
-
-  const chunks = await readStream(await pending);
-  for (const chunk of chunks) {
-    assert.equal(chunk.id, answer.id);
-    assert.equal(chunk.model, answer.model);
-    assert.equal(chunk.created, answer.created);
-  }
-  const choices = chunks.flatMap((chunk) => chunk.choices).filter((choice) => choice.index === 0);
-  assert.ok(choices.some((choice) => choice.delta?.role === "assistant"));
-  assert.equal(choices.map((choice) => choice.delta?.content ?? "").join(""), answer.choices[0].message.content);
-  assert.equal(choices.filter((choice) => typeof choice.finish_reason === "string").at(-1)?.finish_reason, "stop");
+  assert.deepEqual(claim.request, request, "stream:true and stream_options must reach the agent unchanged");
+  const upload = await beginStream(t, runtime, claim.id);
+  const first = encoder.encode(': heartbeat\r\ndata: {"id":"chatcmpl-wire","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"}}]}\r\n\r\n');
+  const tail = Buffer.from(
+    'data: {"id":"chatcmpl-wire","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Zürich 🌊"}}]}\n\n' +
+    'data: {"id":"chatcmpl-wire","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\""}}]}}]}\n\n' +
+    'data: {"id":"chatcmpl-wire","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Zürich\\"}"}},{"index":1,"id":"call_time","type":"function","function":{"name":"get_time","arguments":"{\\"zone\\":\\"Europe/Zurich\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n' +
+    'data: {"id":"chatcmpl-wire","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7},"provider_extra":true}\n\n' +
+    ': provider trailer\n\ndata: [DONE]\n\n',
+  );
+  const firstReceived = deferred();
+  let uploadEnded = false;
+  let acknowledged = false;
+  void upload.delivery.then(() => { acknowledged = true; }, () => {});
+  const producer = (async () => {
+    await upload.write(first);
+    await firstReceived.promise;
+    // Split within the UTF-8 encoding of ü, not just at SSE or JSON boundaries.
+    const split = tail.indexOf(Buffer.from("ü")) + 1;
+    await upload.write(tail.subarray(0, split));
+    await upload.write(tail.subarray(split, split + 1));
+    await upload.write(tail.subarray(split + 1));
+    uploadEnded = true;
+    await upload.close();
+  })();
+  void producer.catch(() => {});
+  const response = await pending;
+  assertStreamHeaders(response);
+  const reader = response.body.getReader();
+  await readPrefix(reader, first);
+  assert.equal(uploadEnded, false, "the first event must not wait for sender EOF");
+  assert.equal(acknowledged, false, "delivery is acknowledged only after sender EOF");
+  firstReceived.resolve();
+  assert.deepEqual(await readRemaining(reader), tail);
+  await producer;
+  await assertAccepted(await upload.delivery);
+  assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
 });
 
-test("streaming tool calls preserves function names, arguments, and tool-call finish reason", { timeout: 30_000 }, async (t) => {
-  const runtime = await createRuntime(t);
-  const pending = startChat(runtime, chatRequest("stream-tools", { stream: true }));
+test("JSON success cannot consume a streaming claim, but a subsequent SSE upload can", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 5000);
+  const pending = startChat(runtime, chatRequest("needs-stream", { stream: true }));
   const [claim] = await claimRequests(runtime, 1);
-  const toolCalls = [
-    { id: "call_weather", type: "function", function: { name: "get_weather", arguments: '{"city":"Zürich"}' } },
-    { id: "call_time", type: "function", function: { name: "get_time", arguments: '{"zone":"Europe/Zurich"}' } },
-  ];
-  const answer = completion("stream-tools", {
-    choices: [{
-      index: 0,
-      message: { role: "assistant", content: null, tool_calls: toolCalls },
-      finish_reason: "tool_calls",
-    }],
-  });
-  await assertAccepted(await post(runtime, "/deliver", AGENT_TOKEN, { id: claim.id, response: answer }));
+  await assertApiError(await post(runtime, "/deliver", AGENT_TOKEN, {
+    id: claim.id, response: completion("not-a-stream"),
+  }), 409, "stream_required");
+  const upload = await beginStream(t, runtime, claim.id);
+  const bytes = encoder.encode('data: {"choices":[{"delta":{"content":"actual stream"}}]}\n\ndata: [DONE]\n\n');
+  await upload.write(bytes);
+  await upload.close();
+  await assertAccepted(await upload.delivery);
+  const response = await pending;
+  assertStreamHeaders(response);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), Buffer.from(bytes));
+});
 
-  const chunks = await readStream(await pending);
-  const choices = chunks.flatMap((chunk) => chunk.choices).filter((choice) => choice.index === 0);
-  assert.ok(choices.some((choice) => choice.delta?.role === "assistant"));
-  const reconstructed = new Map();
-  for (const choice of choices) {
-    for (const part of choice.delta?.tool_calls ?? []) {
-      assert.ok(Number.isInteger(part.index) && part.index >= 0);
-      let call = reconstructed.get(part.index);
-      if (!call) {
-        call = { id: "", type: "", function: { name: "", arguments: "" } };
-        reconstructed.set(part.index, call);
-      }
-      if (part.id !== undefined) call.id += part.id;
-      if (part.type !== undefined) call.type = part.type;
-      call.function.name += part.function?.name ?? "";
-      call.function.arguments += part.function?.arguments ?? "";
-    }
+test("SSE cannot consume a nonstream claim, which remains usable for JSON success", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 5000);
+  const pending = startChat(runtime, chatRequest("needs-json"));
+  const [claim] = await claimRequests(runtime, 1);
+  await assertApiError(await postStream(runtime, claim.id), 409, "stream_not_requested");
+  const answer = completion("needs-json");
+  await assertAccepted(await post(runtime, "/deliver", AGENT_TOKEN, { id: claim.id, response: answer }));
+  assert.deepEqual(await (await pending).json(), answer);
+});
+
+test("JSON agent errors are accepted for a streaming request before upload starts", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 5000);
+  const pending = startChat(runtime, chatRequest("stream-agent-error", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  await assertAccepted(await post(runtime, "/deliver", AGENT_TOKEN, {
+    id: claim.id, error: { message: "Provider unavailable" },
+  }));
+  await assertApiError(await pending, 502);
+});
+
+test("an active SSE upload excludes concurrent and finished deliveries", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 5000);
+  const pending = startChat(runtime, chatRequest("stream-race", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  const upload = await beginStream(t, runtime, claim.id);
+  const first = encoder.encode(": active\n\n");
+  await upload.write(first);
+  const response = await pending;
+  const reader = response.body.getReader();
+  await readPrefix(reader, first);
+  for (const id of [claim.id, UNKNOWN_CLAIM_ID]) {
+    await assertApiError(await postStream(runtime, id), 404);
   }
-  assert.deepEqual([...reconstructed].sort(([left], [right]) => left - right).map(([, call]) => call), toolCalls);
-  assert.equal(choices.filter((choice) => typeof choice.finish_reason === "string").at(-1)?.finish_reason, "tool_calls");
+  await assertApiError(await post(runtime, "/deliver", AGENT_TOKEN, {
+    id: claim.id, error: { message: "racing error" },
+  }), 404);
+  await upload.write("data: [DONE]\n\n");
+  await upload.close();
+  assert.equal((await readRemaining(reader)).toString(), "data: [DONE]\n\n");
+  await assertAccepted(await upload.delivery);
+  await assertApiError(await postStream(runtime, claim.id), 404);
+});
+
+test("a streaming claim canceled before delivery drains and acknowledges a stale upload", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 10_000);
+  const { client, closed } = await openChatSocket(runtime, "stale-canceled-stream", { stream: true });
+  const [claim] = await claimRequests(runtime, 1);
+  client.socket.resetAndDestroy();
+  await closed;
+  // As in the JSON cancellation regression, allow transport cleanup to reach the broker.
+  await delay(100);
+  const upload = await beginStream(t, runtime, claim.id);
+  let acknowledged = false;
+  void upload.delivery.then(() => { acknowledged = true; }, () => {});
+  const frame = `: discarded ${"x".repeat(4096)}\n\n`;
+  for (let index = 0; index < 80; index++) await upload.write(frame);
+  assert.equal(acknowledged, false, "even an abandoned client's upload must drain until EOF");
+  await upload.write("data: [DONE]\n\n");
+  await upload.close();
+  await assertAccepted(await upload.delivery);
+  await assertAccepted(await postStream(runtime, claim.id));
+  await assertAccepted(await post(runtime, "/deliver", AGENT_TOKEN, {
+    id: claim.id, response: completion("repeat-stale-discard"),
+  }));
+  assert.ok(Date.now() < claim.expires_at, "the acknowledgement must not depend on timeout");
+  assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
+});
+
+test("a stream larger than 256 KiB is relayed in modest frames without a total body cap", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 10_000);
+  const pending = startChat(runtime, chatRequest("large-stream", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  const upload = await beginStream(t, runtime, claim.id);
+  const frame = `data: ${JSON.stringify({ choices: [{ delta: { content: "x".repeat(4096) } }] })}\n\n`;
+  const expected = Buffer.from(frame.repeat(80) + "data: [DONE]\n\n");
+  assert.ok(expected.byteLength > 256 * 1024);
+  const received = pending.then(async response => {
+    assertStreamHeaders(response);
+    return Buffer.from(await response.arrayBuffer());
+  });
+  void received.catch(() => {});
+  for (let index = 0; index < 80; index++) await upload.write(frame);
+  await upload.write("data: [DONE]\n\n");
+  await upload.close();
+  await assertAccepted(await upload.delivery);
+  assert.deepEqual(await received, expected);
+});
+
+test("a disconnected midstream client does not abort the agent upload or requeue its job", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 10_000);
+  const { client, closed, response: responsePromise } = await openChatSocket(runtime, "stream-disconnect", { stream: true });
+  const [claim] = await claimRequests(runtime, 1);
+  const upload = await beginStream(t, runtime, claim.id);
+  const first = ": before disconnect\n\n";
+  await upload.write(first);
+  const response = await responsePromise;
+  assert.equal(response.statusCode, 200);
+  const firstReceived = deferred();
+  let received = Buffer.alloc(0);
+  response.on("data", chunk => {
+    received = Buffer.concat([received, chunk]);
+    if (received.byteLength >= Buffer.byteLength(first)) firstReceived.resolve();
+  });
+  await firstReceived.promise;
+  assert.equal(received.toString(), first);
+  client.socket.resetAndDestroy();
+  await closed;
+  // Continue well beyond stream buffering limits after the real TCP RST.
+  const frame = `data: ${JSON.stringify({ choices: [{ delta: { content: "x".repeat(4096) } }] })}\n\n`;
+  for (let index = 0; index < 160; index++) await upload.write(frame);
+  await upload.write("data: [DONE]\n\n");
+  await upload.close();
+  await assertAccepted(await upload.delivery);
+  assert.ok(Date.now() < claim.expires_at, "draining must not wait for the request deadline");
+  assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
+});
+
+test("a timed-out streaming claim drains a late SSE upload and acknowledges only at EOF", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t);
+  const pending = startChat(runtime, chatRequest("stale-stream", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  await assertApiError(await pending, 504, "request_timeout");
+  const upload = await beginStream(t, runtime, claim.id);
+  let acknowledged = false;
+  void upload.delivery.then(() => { acknowledged = true; }, () => {});
+  const frame = `: ${"discard".repeat(1024)}\n\n`;
+  for (let index = 0; index < 80; index++) await upload.write(frame);
+  assert.equal(acknowledged, false);
+  await upload.write("data: [DONE]\n\n");
+  await upload.close();
+  await assertAccepted(await upload.delivery);
+  assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
+});
+
+test("the original deadline terminates an active client stream while the agent can finish draining", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 1500);
+  const pending = startChat(runtime, chatRequest("stream-deadline", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  const upload = await beginStream(t, runtime, claim.id);
+  const first = encoder.encode(": initial\n\n");
+  await upload.write(first);
+  const response = await pending;
+  assertStreamHeaders(response);
+  const reader = response.body.getReader();
+  await readPrefix(reader, first);
+  const remainder = await readRemaining(reader);
+  assert.ok(Date.now() >= claim.expires_at, "termination must use the original request deadline");
+  assert.equal(remainder.includes(Buffer.from("[DONE]")), false);
+  const terminal = JSON.parse(remainder.toString().trim().replace(/^data:\s*/, ""));
+  assert.equal(terminal.error.code, "request_timeout");
+  await upload.write(": late bytes still drain\n\ndata: [DONE]\n\n");
+  await upload.close();
+  await assertAccepted(await upload.delivery);
+  assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
+});
+
+test("producer transport failure before DONE fails delivery and cannot fabricate a completed stream", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 5000);
+  const pending = startChat(runtime, chatRequest("stream-producer-failure", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  const upload = await beginStream(t, runtime, claim.id);
+  const first = encoder.encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
+  await upload.write(first);
+  const response = await pending;
+  assertStreamHeaders(response);
+  const reader = response.body.getReader();
+  await readPrefix(reader, first);
+  const remainder = readRemaining(reader);
+  await upload.fail(new Error("Agent input transport failed"));
+  let delivered;
+  try { delivered = await upload.delivery; } catch { /* A broken upload can reject fetch itself. */ }
+  if (delivered) assert.ok(delivered.status >= 400, "a broken upload must not be acknowledged as successful");
+  const tail = await remainder;
+  assert.equal(tail.includes(Buffer.from("[DONE]")), false);
+  const terminal = JSON.parse(tail.toString().trim().replace(/^data:\s*/, ""));
+  assert.equal(terminal.error.code, "agent_stream_error");
+  assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
 });
 
 test("small malformed requests and invalid delivery shapes return 400 without queueing work", { timeout: 30_000 }, async (t) => {
@@ -379,5 +651,24 @@ test("the 256 KiB request-body limit rejects oversized prompts before queueing",
   const body = chatRequest("oversized");
   body.messages[1].content = "x".repeat(256 * 1024);
   await assertApiError(await post(runtime, "/v1/chat/completions", CLIENT_TOKEN, body), 413);
+  assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
+});
+
+test("cancellation arriving before enqueue prevents a ghost job", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 5000);
+  const namespace = await runtime.getDurableObjectNamespace("BROKER");
+  const broker = namespace.get(namespace.idFromName("cadge"));
+  const headers = {
+    "X-Cadge-Request-ID": crypto.randomUUID(),
+    "X-Cadge-Request-Deadline": String(Date.now() + 3000),
+    "Content-Type": "application/json",
+  };
+  // Exercise the real broker in the network ordering that can precede enqueue.
+  const cancelled = await broker.fetch("https://broker/cancel", { method: "POST", headers });
+  assert.equal(cancelled.status, 204);
+  const delayed = await broker.fetch("https://broker/v1/chat/completions", {
+    method: "POST", headers, body: JSON.stringify(chatRequest("already-abandoned")),
+  });
+  await assertApiError(delayed, 499, "request_cancelled");
   assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
 });

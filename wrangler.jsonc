@@ -3,6 +3,7 @@
   "name": "cadge",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-30",
+  "compatibility_flags": ["enable_request_signal"],
   "durable_objects": {
     "bindings": [{ "name": "BROKER", "class_name": "Broker" }]
   },
@@ -10,5 +11,10 @@
   "vars": {
     "MODEL_ID": "cadge",
     "REQUEST_TIMEOUT_MS": "120000"
-  }
+  },
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "cadge.isekai.date", "custom_domain": true }
+  ]
 }

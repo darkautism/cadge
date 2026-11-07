@@ -3,8 +3,17 @@ import { apiError, type ChatRequest, type Completion, type Env } from "./protoco
 const CLEANUP_BATCH_SIZE = 128;
 const TOMBSTONE_RETENTION_MS = 5 * 60 * 1000;
 
+interface StreamRelay {
+  push: (chunk: Uint8Array) => Promise<void>;
+  close: () => void;
+  stop: (error: Error, code: string) => void;
+}
+
 interface Waiter {
+  requestId: string;
   expiresAt: number;
+  streaming: boolean;
+  relay?: StreamRelay;
   resolve: (response: Response) => void;
   timer: number;
   signal: AbortSignal;
@@ -27,6 +36,9 @@ export class Broker {
   private readonly sql: SqlStorage;
   private readonly runtimeId = crypto.randomUUID();
   private readonly waiters = new Map<number, Waiter>();
+  private readonly jobsByRequestId = new Map<string, number>();
+  private readonly cancelledRequests = new Map<string, number>();
+  private readonly delivering = new Set<string>();
   private alarmDeadline: number | null | undefined;
   private alarmWrite: Promise<void> | undefined;
 
@@ -68,7 +80,11 @@ export class Broker {
       case "/beg":
         return this.claim();
       case "/deliver":
-        return this.deliver(await request.json<Delivery>());
+        return request.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase() === "text/event-stream"
+          ? this.deliverStream(request)
+          : this.deliver(await request.json<Delivery>());
+      case "/cancel":
+        return this.cancel(request);
       default:
         return apiError(404, "Not found.", "not_found");
     }
@@ -83,11 +99,20 @@ export class Broker {
   }
 
   private async enqueue(request: Request): Promise<Response> {
+    const requestId = request.headers.get("X-Cadge-Request-ID");
+    const expiresAt = Number(request.headers.get("X-Cadge-Request-Deadline"));
+    if (!requestId || !Number.isSafeInteger(expiresAt) || expiresAt <= 0) {
+      return apiError(400, "Missing internal request correlation.", "invalid_request");
+    }
     const body = await request.text();
-    if (request.signal.aborted) {
+    // An explicit cancellation can beat the enqueue fetch or its body read.
+    const cancelled = this.cancelledRequests.delete(requestId);
+    if (cancelled || request.signal.aborted) {
+      if (cancelled) await this.scheduleAlarm();
       return apiError(499, "The caller disconnected.", "request_cancelled");
     }
-    const expiresAt = Date.now() + Number(this.env.REQUEST_TIMEOUT_MS ?? "120000");
+    // Once a marker expires, even a very late enqueue cannot revive its job.
+    if (expiresAt <= Date.now()) return this.timeoutResponse();
     const { id } = this.sql.exec<{ id: number }>(
       `INSERT INTO jobs (runtime_id, request_json, expires_at)
        VALUES (?, ?, ?) RETURNING id`,
@@ -99,16 +124,38 @@ export class Broker {
       this.state.waitUntil(this.scheduleAlarm());
     };
     const waiter: Waiter = {
+      requestId,
       expiresAt,
       resolve,
+      streaming: (JSON.parse(body) as ChatRequest).stream === true,
       signal: request.signal,
       abort,
       timer: setTimeout(() => this.onTimeout(id), Math.max(0, expiresAt - Date.now())),
     };
     this.waiters.set(id, waiter);
+    this.jobsByRequestId.set(requestId, id);
     request.signal.addEventListener("abort", abort, { once: true });
+    if (request.signal.aborted) abort();
     await this.scheduleAlarm();
     return response;
+  }
+
+  private async cancel(request: Request): Promise<Response> {
+    const requestId = request.headers.get("X-Cadge-Request-ID");
+    const deadline = Number(request.headers.get("X-Cadge-Request-Deadline"));
+    if (!requestId || !Number.isSafeInteger(deadline) || deadline <= 0) {
+      return apiError(400, "Missing internal request correlation.", "invalid_request");
+    }
+    const id = this.jobsByRequestId.get(requestId);
+    if (id !== undefined) {
+      this.expire(id, apiError(499, "The caller disconnected.", "request_cancelled"));
+    } else if (deadline > Date.now()) {
+      // This can also be a late cancel after delivery: retain only an ephemeral
+      // marker, never a new SQL job or prompt. The enqueue deadline bounds it.
+      this.cancelledRequests.set(requestId, deadline);
+    }
+    await this.scheduleAlarm();
+    return new Response(null, { status: 204 });
   }
 
   private async claim(): Promise<Response> {
@@ -140,6 +187,9 @@ export class Broker {
   }
 
   private async deliver(delivery: Delivery): Promise<Response> {
+    if (this.delivering.has(delivery.id)) {
+      return apiError(404, "Unknown or already delivered claim.", "claim_not_found");
+    }
     const now = Date.now();
     const job = this.sql.exec<JobRow>(
       `SELECT id, claim_id, expires_at, request_json, runtime_id
@@ -151,14 +201,18 @@ export class Broker {
         delivery.id, now,
       ).toArray()[0];
       return expired
-        ? apiError(410, "The caller is no longer waiting.", "request_expired")
+        ? Response.json({ accepted: true }, { headers: { "Cache-Control": "no-store" } })
         : apiError(404, "Unknown or already delivered claim.", "claim_not_found");
     }
     const waiter = this.waiters.get(job.id);
     if (job.expires_at <= now || !waiter || waiter.signal.aborted) {
+      // The agent need not know its caller left: discard the result and acknowledge it.
       this.expire(job.id, this.timeoutResponse());
       await this.scheduleAlarm();
-      return apiError(410, "The caller is no longer waiting.", "request_expired");
+      return Response.json({ accepted: true }, { headers: { "Cache-Control": "no-store" } });
+    }
+    if (waiter.streaming && !("error" in delivery)) {
+      return apiError(409, "This claim requires an SSE upload.", "stream_required");
     }
     // Delete before resolving, with no await: every subsequent delivery sees 404.
     this.sql.exec("DELETE FROM jobs WHERE id = ?", job.id);
@@ -168,6 +222,135 @@ export class Broker {
     this.settle(job.id, result);
     await this.scheduleAlarm();
     return Response.json({ accepted: true }, { headers: { "Cache-Control": "no-store" } });
+  }
+
+  private async deliverStream(request: Request): Promise<Response> {
+    const claimId = request.headers.get("X-Cadge-Claim-ID");
+    if (!claimId || !request.body) {
+      return apiError(400, "Missing claim ID or SSE upload body.", "invalid_request");
+    }
+    if (this.delivering.has(claimId)) {
+      return apiError(404, "Unknown or already delivered claim.", "claim_not_found");
+    }
+    const now = Date.now();
+    const job = this.sql.exec<JobRow>(
+      `SELECT id, claim_id, expires_at, request_json, runtime_id
+       FROM jobs WHERE claim_id = ?`, claimId,
+    ).toArray()[0];
+    let waiter = job ? this.waiters.get(job.id) : undefined;
+    if (!job) {
+      const expired = this.sql.exec<{ claim_id: string }>(
+        `SELECT claim_id FROM expired_claims WHERE claim_id = ? AND purge_at > ?`,
+        claimId, now,
+      ).toArray()[0];
+      if (!expired) {
+        return apiError(404, "Unknown or already delivered claim.", "claim_not_found");
+      }
+    } else if (job.expires_at <= now || !waiter || waiter.signal.aborted) {
+      this.expire(job.id, this.timeoutResponse());
+      waiter = undefined;
+    } else if (!waiter.streaming) {
+      return apiError(409, "This claim did not request streaming.", "stream_not_requested");
+    }
+
+    // Reserve before yielding, including discarded uploads. Cancellation removes
+    // the SQL job, but this reservation rejects duplicates until the upload ends.
+    this.delivering.add(claimId);
+    let relay: StreamRelay | undefined;
+    if (waiter && job) {
+      const downstream = this.createRelay(job.id);
+      relay = downstream.relay;
+      waiter.relay = relay;
+      // Keep the waiter, deadline and request correlation for the body lifetime.
+      waiter.resolve(new Response(downstream.body, {
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-store",
+          "X-Accel-Buffering": "no",
+        },
+      }));
+    }
+    const upload = this.pumpUpload(request.body, claimId, job?.id, relay);
+    // Client cancellation must not cancel the producer: continue reading to EOF.
+    this.state.waitUntil(upload.catch(() => {}));
+    try {
+      await upload;
+      return Response.json({ accepted: true }, { headers: { "Cache-Control": "no-store" } });
+    } catch {
+      return apiError(502, "The agent stream upload failed.", "agent_stream_error");
+    }
+  }
+
+  private createRelay(id: number): { body: ReadableStream<Uint8Array>; relay: StreamRelay } {
+    let controller: ReadableStreamDefaultController<Uint8Array>;
+    let ready = Promise.withResolvers<void>();
+    let stopped = false;
+    const body = new ReadableStream<Uint8Array>({
+      start: (streamController) => { controller = streamController; },
+      pull: () => { ready.resolve(); },
+      cancel: () => {
+        stopped = true;
+        ready.resolve();
+        this.expire(id, apiError(499, "The caller disconnected.", "request_cancelled"));
+        this.state.waitUntil(this.scheduleAlarm());
+      },
+    }, { highWaterMark: 0 });
+    const relay: StreamRelay = {
+      push: async (chunk) => {
+        if (stopped) return;
+        await ready.promise;
+        if (stopped) return;
+        ready = Promise.withResolvers<void>();
+        controller.enqueue(chunk);
+      },
+      close: () => {
+        if (stopped) return;
+        stopped = true;
+        ready.resolve();
+        controller.close();
+      },
+      stop: (error, code) => {
+        if (stopped) return;
+        stopped = true;
+        // Release forwarding, then expose failure as SSE: HTTP proxies may turn
+        // controller.error() into an indistinguishable clean EOF.
+        ready.resolve();
+        controller.enqueue(new TextEncoder().encode(`\n\ndata: ${JSON.stringify({ error: {
+          message: error.message, type: "server_error", param: null, code,
+        } })}\n\n`));
+        controller.close();
+      },
+    };
+    return { body, relay };
+  }
+
+  private async pumpUpload(
+    body: ReadableStream<Uint8Array>,
+    claimId: string,
+    jobId: number | undefined,
+    relay: StreamRelay | undefined,
+  ): Promise<void> {
+    const reader = body.getReader();
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        // One input chunk at a time; no JSON parsing, decoding or accumulation.
+        if (relay) await relay.push(chunk.value);
+      }
+      relay?.close();
+    } catch (error) {
+      relay?.stop(new Error("The agent stream upload failed."), "agent_stream_error");
+      throw error;
+    } finally {
+      reader.releaseLock();
+      if (jobId !== undefined) {
+        this.sql.exec("DELETE FROM jobs WHERE id = ?", jobId);
+        this.detachWaiter(jobId);
+      }
+      this.delivering.delete(claimId);
+      await this.scheduleAlarm();
+    }
   }
 
   private onTimeout(id: number): void {
@@ -195,19 +378,31 @@ export class Broker {
       }
       this.sql.exec("DELETE FROM jobs WHERE id = ?", id);
     });
+    this.waiters.get(id)?.relay?.stop(
+      new Error(response.status === 504 ? "The request timed out." : "The caller disconnected."),
+      response.status === 504 ? "request_timeout" : "request_cancelled",
+    );
     this.settle(id, response);
   }
 
   private settle(id: number, response: Response): void {
+    this.detachWaiter(id)?.resolve(response);
+  }
+
+  private detachWaiter(id: number): Waiter | undefined {
     const waiter = this.waiters.get(id);
-    if (!waiter) return;
+    if (!waiter) return undefined;
     this.waiters.delete(id);
+    this.jobsByRequestId.delete(waiter.requestId);
     clearTimeout(waiter.timer);
     waiter.signal.removeEventListener("abort", waiter.abort);
-    waiter.resolve(response);
+    return waiter;
   }
 
   private cleanup(now: number): void {
+    for (const [requestId, deadline] of this.cancelledRequests) {
+      if (deadline <= now) this.cancelledRequests.delete(requestId);
+    }
     const expired = this.sql.exec<{ id: number }>(
       `SELECT id FROM jobs WHERE expires_at <= ? OR runtime_id <> ?
        ORDER BY id LIMIT ?`, now, this.runtimeId, CLEANUP_BATCH_SIZE,
@@ -225,13 +420,16 @@ export class Broker {
     const orphan = this.sql.exec<{ id: number }>(
       "SELECT id FROM jobs WHERE runtime_id <> ? LIMIT 1", this.runtimeId,
     ).toArray()[0];
-    const { deadline } = this.sql.exec<{ deadline: number | null }>(
+    let { deadline } = this.sql.exec<{ deadline: number | null }>(
       `SELECT MIN(deadline) AS deadline FROM (
          SELECT MIN(expires_at) AS deadline FROM jobs
          UNION ALL
          SELECT MIN(purge_at) AS deadline FROM expired_claims
        )`,
     ).one();
+    for (const cancellationDeadline of this.cancelledRequests.values()) {
+      deadline = deadline === null ? cancellationDeadline : Math.min(deadline, cancellationDeadline);
+    }
     const target = orphan
       ? Date.now() + 1
       : deadline === null ? null : Math.max(Date.now() + 1, deadline);

@@ -78,7 +78,7 @@ export async function readResponse(source) {
   return validateCompletion(parseJson(text, "Response"));
 }
 
-async function post(config, path, body, signal) {
+async function post(config, path, body, signal, streamId) {
   let response;
   let text;
   try {
@@ -86,9 +86,13 @@ async function post(config, path, body, signal) {
       method: "POST",
       headers: {
         Authorization: `Bearer ${config.token}`,
-        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...(streamId === undefined
+          ? (body === undefined ? {} : { "Content-Type": "application/json" })
+          : { "Content-Type": "text/event-stream", "X-Cadge-Claim-ID": streamId }),
       },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(streamId === undefined
+        ? (body === undefined ? {} : { body: JSON.stringify(body) })
+        : { body, duplex: "half" }),
       redirect: "error",
       signal,
     });
@@ -124,6 +128,18 @@ export async function beg(config, signal) {
 
 export async function deliver(config, body, signal) {
   const { status, text } = await post(config, "/deliver", body, signal);
+  return acceptedDelivery(status, text);
+}
+
+export async function deliverStream(config, id, body, signal) {
+  if (!validId(id)) throw new Error("A claim UUID from /beg is required for streaming delivery.");
+  // Node fetch consumes Node Readables and web ReadableStreams incrementally,
+  // applying backpressure instead of collecting the SSE upload in memory.
+  const { status, text } = await post(config, "/deliver", body, signal, id);
+  return acceptedDelivery(status, text);
+}
+
+function acceptedDelivery(status, text) {
   if (status !== 200) throw new Error(`POST /deliver returned unexpected HTTP ${status}.`);
   const accepted = parseJson(text, "POST /deliver response");
   if (!isObject(accepted) || accepted.accepted !== true) {
