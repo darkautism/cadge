@@ -4,6 +4,22 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-07-30",
   "compatibility_flags": ["enable_request_signal"],
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true,
+      "persist": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true
+    },
+    "issues": {
+      "enabled": false
+    }
+  },
   "durable_objects": {
     "bindings": [{ "name": "BROKER", "class_name": "Broker" }]
   },

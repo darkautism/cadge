@@ -272,6 +272,8 @@ npx wrangler login
 
 保留 `durable_objects` binding 與 `migrations`。它們會在首次部署時建立 SQLite-backed `Broker`，不需要手動建立 Queue、D1 或 KV。不要把 token 放進 `vars`。
 
+`observability` 已啟用 logs 與 traces：兩者 `head_sampling_rate: 1`、`persist: true`，並開啟 `logs.invocation_logs`；這是完整取樣，不只記錄錯誤，會增加相應的可觀測性用量。可在 Cloudflare Dashboard 的 Worker Observability 查看部署後的新紀錄。本設定使用目前 Wrangler 支援的 `issues.enabled: false` 關閉 Issues，不是 `issue_detection` 欄位；不額外輸出 prompt、Bearer token 或答案內容。
+
 ### 3. 發布 Worker
 
 ```sh
