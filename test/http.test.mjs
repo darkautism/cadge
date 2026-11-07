@@ -567,26 +567,59 @@ test("a timed-out streaming claim drains a late SSE upload and acknowledges only
   assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
 });
 
-test("the original deadline terminates an active client stream while the agent can finish draining", { timeout: 30_000 }, async (t) => {
+test("first SSE bytes remove the deadline through idle gaps, alarms, and later queue cleanup", { timeout: 30_000 }, async (t) => {
   const runtime = await createRuntime(t, 1500);
-  const pending = startChat(runtime, chatRequest("stream-deadline", { stream: true }));
+  const pending = startChat(runtime, chatRequest("stream-first-byte-deadline", { stream: true }));
   const [claim] = await claimRequests(runtime, 1);
   const upload = await beginStream(t, runtime, claim.id);
-  const first = encoder.encode(": initial\n\n");
+  const first = encoder.encode('data: {"choices":[{"delta":{"content":"first"}}]}\n\n');
   await upload.write(first);
   const response = await pending;
   assertStreamHeaders(response);
   const reader = response.body.getReader();
   await readPrefix(reader, first);
-  const remainder = await readRemaining(reader);
-  assert.ok(Date.now() >= claim.expires_at, "termination must use the original request deadline");
-  assert.equal(remainder.includes(Buffer.from("[DONE]")), false);
-  const terminal = JSON.parse(remainder.toString().trim().replace(/^data:\s*/, ""));
-  assert.equal(terminal.error.code, "request_timeout");
-  await upload.write(": late bytes still drain\n\ndata: [DONE]\n\n");
-  await upload.close();
-  await assertAccepted(await upload.delivery);
+  await delay(150);
+  // Another request keeps an alarm scheduled after this stream's old deadline.
+  await assertApiError(await startChat(runtime, chatRequest("still-waiting")), 504, "request_timeout");
+  assert.ok(Date.now() > claim.expires_at, "the active stream must outlive its initial deadline");
   assert.equal((await post(runtime, "/beg", AGENT_TOKEN)).status, 204);
+  const tail = encoder.encode('data: {"choices":[{"delta":{"content":"late tail"}}]}\n\ndata: [DONE]\n\n');
+  const remaining = readRemaining(reader);
+  await upload.write(tail);
+  await upload.close();
+  assert.deepEqual(await remaining, Buffer.from(tail));
+  await assertAccepted(await upload.delivery);
+});
+
+test("opening SSE upload headers without bytes does not remove the initial deadline", { timeout: 30_000 }, async (t) => {
+  const runtime = await createRuntime(t, 1500);
+  const pending = startChat(runtime, chatRequest("headers-are-not-first-bytes", { stream: true }));
+  const [claim] = await claimRequests(runtime, 1);
+  const upload = httpRequest(new URL("/deliver", await runtime.unsafeGetDirectURL()), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${AGENT_TOKEN}`, "Content-Type": "text/event-stream",
+      "X-Cadge-Claim-ID": claim.id, "Transfer-Encoding": "chunked" },
+  });
+  const acknowledged = new Promise((resolve, reject) => {
+    upload.on("error", reject);
+    upload.on("response", response => {
+      let body = "";
+      response.setEncoding("utf8").on("data", chunk => { body += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode, body }));
+    });
+  });
+  void acknowledged.catch(() => {});
+  t.after(() => upload.destroy());
+  upload.flushHeaders();
+  const response = await pending;
+  assertStreamHeaders(response);
+  const terminal = JSON.parse((await response.text()).trim().replace(/^data:\s*/, ""));
+  assert.equal(terminal.error.code, "request_timeout");
+  assert.ok(Date.now() >= claim.expires_at);
+  upload.end(": late bytes are discarded\n\ndata: [DONE]\n\n");
+  const accepted = await acknowledged;
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(JSON.parse(accepted.body), { accepted: true });
 });
 
 test("producer transport failure before DONE fails delivery and cannot fabricate a completed stream", { timeout: 30_000 }, async (t) => {

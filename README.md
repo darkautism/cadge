@@ -68,13 +68,13 @@ curl -i http://localhost:8787/beg \
 
 - `id` 是**領取成功時產生的 UUID**，供交付使用，不是 OpenAI completion id。
 - `request` 保留原始請求欄位，包括 `tools`、參數與 `stream`；Cadge 不計算 token，也不實作模型參數的語意。
-- `expires_at` 為 Unix 毫秒；從 Client 入列開始計時，不是從 Agent 領取開始。
+- `expires_at` 為 Unix 毫秒的初始等待期限；從 Client 入列開始計時，不是從 Agent 領取開始。串流首段資料到達後解除此期限。
 - 沒工作回 `204 No Content`，無 body，附 `Retry-After: 5`。Agent 必須自行實作等待；此值只是提示，不是伺服器限流。
 - SQL 單一 `UPDATE … RETURNING` 完成選取與領取，同一筆工作不會被兩次成功領取。
 
 Agent 可以自行選擇如何取得答案。如果轉送至真正的 OpenAI provider，應自行映射模型識別字，並依 `job.request.stream` 選擇模式：非串流交付完整 completion；`stream: true` 則立即轉送上游原始 OpenAI SSE，不要先收集整份結果，也不要把 SSE 文字當 completion JSON。
 
-Agent 領取工作即承諾在 `expires_at` 前完成交付。**不另外設定首段或相鄰 chunk 的短秒數時限**：暖機慢、例如 50 秒才開始送資料，只要整筆請求尚未到期仍可交付；不會因為幾秒沒有輸出就判定 Agent 死亡。排隊、暖機與整段串流共用原始時間預算，收到 chunk 不會重設 deadline。
+Agent 應在 `expires_at` 前交付首個非空 SSE chunk；僅認領或開啟上傳標頭不算開始回覆。**首段資料到達後立即解除 deadline，不再限制整段串流總時長或相鄰 chunk 間隔**，不因沉默幾秒或原始 120 秒已到而中斷。暖機慢、例如 50 秒才開始送資料，只要首段仍在初始期限內即可。非串流請求則必須在初始期限內交付完整 completion。
 
 ### 3. Agent 交付
 
@@ -158,7 +158,7 @@ Agent 處理失敗也必須交付，讓 Client 不必等到逾時：
 
 待辦請求保存在 SQLite；交付、取消或到期時刪除 prompt，不保存結果。取消／逾時的已領取 UUID 僅保留約 5 分鐘的無內容標記，期間內晚到的有效交付仍回 `200 {"accepted":true}`，不回傳 `discarded` 等額外欄位。超過識別碼保留期則視為未知 UUID、回 `404`；標記由 alarm 批次清理。
 
-**不自動重新派工。** Agent 領取後失聯，尚未開始回應的原始請求在 deadline 時回 `504`；已開始的 SSE 以錯誤事件結束，HTTP 狀態無法再更改。同一份仍有效的請求只會轉交一次，但這不等於外部模型推理 exactly-once：若領取回應在網路途中遺失，該工作仍已領取。對已結束工作的正常收件回應不代表重新轉交。
+**不自動重新派工。** Agent 領取後失聯、初始期限內仍未開始回覆時，尚未開啟回應的請求回 `504`；若已開啟 SSE 但仍沒有資料，則以 `request_timeout` 錯誤事件結束，HTTP 狀態無法再更改。已收到首段的串流不再受初始期限限制；上傳本身失敗仍以 SSE 錯誤結束。同一份仍有效的請求只會轉交一次，但這不等於外部模型推理 exactly-once：若領取回應在網路途中遺失，該工作仍已領取。對已結束工作的正常收件回應不代表重新轉交。
 
 HTTP 連線與記憶體中的等待者不能跨 runtime 重啟還原。重啟時清除無法再交付的前一個 runtime 工作；Client 可能收到連線錯誤或 `503`。此 API 沒有非同步結果查詢或跨連線恢復。
 
@@ -173,7 +173,7 @@ HTTP 連線與記憶體中的等待者不能跨 runtime 重啟還原。重啟時
 
 `wrangler.jsonc` 已顯式啟用 `enable_request_signal`。入口收到 abort 後，以 `ctx.waitUntil` 發出不帶已取消 signal 的內部取消通知，確保 Durable Object 執行清理；不只依賴跨服務轉傳 AbortSignal。
 
-**停止等待不一定等於取消 HTTP。** Client 端若只做 `Promise.race`／忽略回應，卻沒有 abort／close 實際連線，伺服器無從知道；網路中斷、代理或 runtime 也可能延遲／沒有傳遞取消通知。這些情況仍由 `REQUEST_TIMEOUT_MS`（預設 120 秒）清理，不能承諾所有 `Ctrl-C` 都在固定毫秒內被偵測。
+**停止等待不一定等於取消 HTTP。** Client 端若只做 `Promise.race`／忽略回應，卻沒有 abort／close 實際連線，伺服器無從知道；網路中斷、代理或 runtime 也可能延遲／沒有傳遞取消通知。尚未開始回覆的請求仍由 `REQUEST_TIMEOUT_MS`（預設 120 秒）清理；已開始的串流則等待 EOF、傳輸失敗或實際取消通知，沒有另一個總時長／idle timeout，不能承諾所有 `Ctrl-C` 都在固定毫秒內被偵測。
 
 本機的 Wrangler／Miniflare 代理不一定轉傳斷線事件。取消回歸測試直接連 workerd socket，以真實 TCP reset 驗證；普通 TCP FIN 是半關閉，可能要等後續寫入才偵測到。正式環境的代理／Client 取消行為仍需在自己的部署驗證。
 
@@ -190,7 +190,7 @@ HTTP 連線與記憶體中的等待者不能跨 runtime 重啟還原。重啟時
 
 [Cloudflare HTTP Workers](https://developers.cloudflare.com/workers/platform/limits/#duration) 與 [Durable Object HTTP](https://developers.cloudflare.com/durable-objects/platform/limits/#wall-time-limits-by-invocation-type) 在呼叫端保持連線時沒有固定 wall-clock 執行時限，不是每 30 秒必須收到一個 chunk。CPU 限制不包含等待網路資料的時間；`waitUntil()` 的 30 秒寬限是回應結束／斷線後的背景工作限制，不是正常串流上限。平台仍有 CPU、記憶體等限制，連線也可能因 runtime 更新或其他網路錯誤中斷。
 
-Cadge 自己的 `REQUEST_TIMEOUT_MS` 從入列起算，預設 120 秒，包含排隊及整段串流；Client／代理也可能有各自的 timeout。Agent 分段寫入與 `accepted:true` 只代表交付端收件，不能單憑它們定位 Client 緩衝或中途斷線原因。Cadge 不主動插入 heartbeat；上游的 SSE 註解照原樣轉送，但不會延長總 deadline。
+Cadge 自己的 `REQUEST_TIMEOUT_MS` 從入列起算，預設 120 秒，僅限制排隊與等待首段 SSE 的時間；非串流則等待完整回覆。首個非空 SSE chunk 到達後解除期限，沒有串流總時長或 chunk idle timeout，也不需要 heartbeat 延命。Client／代理仍可能有各自的 timeout。Agent 分段寫入與 `accepted:true` 只代表交付端收件，不能單憑它們定位 Client 緩衝或中途斷線原因。Cadge 不主動插入 heartbeat；上游的 SSE 註解照原樣轉送。
 
 
 ## Agent hooks
@@ -245,12 +245,12 @@ CADGE_POLL_INTERVAL_MS=10000 ./scripts/poll.mjs -- ./my-agent
 
 - stdin：原始 `job.request` JSON 加換行，所有欄位保留；adapter 自行映射真正 provider 的模型，並遵守原始 `stream` 模式。
 - stdout：`stream: true` 時為 raw OpenAI SSE，poller 立即以背壓上傳，不收集或重新編碼；其他工作為恰好一個完整 `chat.completion` JSON。log 一律寫到 stderr。
-- 環境變數：額外提供 `CADGE_JOB_ID` 與毫秒單位的 `CADGE_EXPIRES_AT`。
+- 環境變數：額外提供 `CADGE_JOB_ID` 與毫秒單位的 `CADGE_EXPIRES_AT`；後者是首段 SSE／非串流完整回覆的初始等待期限，不是已開始串流的結束時間。
 - 成功 exit `0`；失敗 exit 非零。adapter 繼承 Agent 環境，請只執行受信任的命令。
 
 poller 預設空等 **5 秒**再領，`CADGE_POLL_INTERVAL_MS=10000` 可改成 10 秒；成功交付後立即領下一筆。它不使用 shell 解譯命令，不會自動重試結果不明的領取／交付。非串流 stdout 格式錯誤或子程式失敗，交付一次 JSON error 後非零退出。串流子程式啟動失敗也走 JSON error；已開始上傳後失敗，則附加 SSE error 事件、完成該次上傳，再非零退出，不另送第二次交付，也不補 `[DONE]`。
 
-`Ctrl-C`／`SIGTERM` 會停止 polling 並終止正在執行的子程式，不會交付假答案；執行超過 job deadline 也會終止。POSIX 系統會終止子程式群組，必要時在 1 秒後強制結束。尚未開始交付的工作不自動重派，原始 Client 會逾時；已開始的串流會中斷並回報錯誤。這是 Agent 自身停止的行為，不是 Client 取消時通知 Agent。
+`Ctrl-C`／`SIGTERM` 會停止 polling 並終止正在執行的子程式，不會交付假答案。尚未輸出非空 SSE chunk 的串流子程式及尚未完成的非串流程式，在初始 deadline 到達時也會終止；**串流首段輸出後永久解除此 timer，不再因原始 deadline 殺掉子程式**。POSIX 系統會終止子程式群組，必要時在 1 秒後強制結束。尚未開始交付的工作不自動重派，原始 Client 會逾時；因 Agent 自身停止而中斷的串流仍回報錯誤。這不是 Client 取消時通知 Agent。
 
 
 ## 部署到 Cloudflare
@@ -394,7 +394,7 @@ WAF 保護的是未授權的邊緣流量，不是「保證永不超額」；白�
 | 設定 | 預設值 | 說明 |
 |---|---|---|
 | `MODEL_ID` | `cadge` | 對 Client 公告並接受的模型識別字 |
-| `REQUEST_TIMEOUT_MS` | `120000` | 100–600000 毫秒，含佇列等待及整段串流時間 |
+| `REQUEST_TIMEOUT_MS` | `120000` | 100–600000 毫秒，含佇列與首段 SSE 等待；首段後解除。非串流等待完整回覆 |
 | `CLIENT_TOKEN` | 無 | Client 用 secret |
 | `AGENT_TOKEN` | 無 | Agent 用 secret，不能與 Client 相同 |
 

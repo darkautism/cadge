@@ -18,10 +18,12 @@ to stderr, which is forwarded. No model, provider, or inference implementation
 is supplied by these hooks.
 
 The child inherits the environment, with CADGE_JOB_ID set to the claim UUID
-and CADGE_EXPIRES_AT set to the Unix deadline in milliseconds. It is terminated
-at that deadline. SIGINT/SIGTERM stop polling and terminate the current child;
-termination escalates to SIGKILL after 1 second (including the process group
-on POSIX). Stopping does not submit a result or start another command.
+and CADGE_EXPIRES_AT set to the initial response deadline in Unix milliseconds.
+Streaming stdout's first nonempty chunk permanently clears that deadline;
+non-streaming output must finish before it. SIGINT/SIGTERM stop polling and
+terminate the current child; termination escalates to SIGKILL after 1 second
+(including the process group on POSIX). Stopping does not submit a result or
+start another command.
 
 Non-streaming stdout is delivered as {id, response}; child failure or invalid
 JSON stdout is delivered as {id, error: {message}}. For streaming jobs, startup
@@ -69,6 +71,7 @@ function runCommand(config, command, args, job, stopSignal) {
     let closed = false;
     let terminating = false;
     let streamingStarted = false;
+    let firstStreamBytes = false;
     let failure;
     let deadlineTimer;
     let killTimer;
@@ -98,6 +101,7 @@ function runCommand(config, command, args, job, stopSignal) {
     }
 
     function armDeadline() {
+      if (firstStreamBytes) return;
       const remaining = job.expires_at - Date.now();
       if (remaining <= 0) {
         failure ??= "The agent command exceeded the job expiry deadline.";
@@ -113,7 +117,13 @@ function runCommand(config, command, args, job, stopSignal) {
 
     async function* streamOutput() {
       try {
-        for await (const chunk of child.stdout) yield chunk;
+        for await (const chunk of child.stdout) {
+          if (!firstStreamBytes && chunk.length > 0) {
+            firstStreamBytes = true;
+            clearTimeout(deadlineTimer);
+          }
+          yield chunk;
+        }
       } catch {
         failure ??= "Could not read the agent command's stdout.";
         terminate();

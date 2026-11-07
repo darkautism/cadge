@@ -13,6 +13,7 @@ interface Waiter {
   requestId: string;
   expiresAt: number;
   streaming: boolean;
+  streamStarted: boolean;
   relay?: StreamRelay;
   resolve: (response: Response) => void;
   timer: number;
@@ -24,6 +25,7 @@ type JobRow = {
   id: number;
   claim_id: string | null;
   expires_at: number;
+  stream_started: number;
   request_json: string;
   runtime_id: string;
 };
@@ -53,11 +55,18 @@ export class Broker {
         runtime_id TEXT NOT NULL,
         request_json TEXT NOT NULL,
         expires_at INTEGER NOT NULL,
-        claim_id TEXT UNIQUE
+        claim_id TEXT UNIQUE,
+        stream_started INTEGER NOT NULL DEFAULT 0
       )`);
+      const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(jobs)").toArray();
+      if (!columns.some(column => column.name === "stream_started")) {
+        this.sql.exec("ALTER TABLE jobs ADD COLUMN stream_started INTEGER NOT NULL DEFAULT 0");
+      }
       this.sql.exec(`CREATE INDEX IF NOT EXISTS jobs_pending
         ON jobs (runtime_id, id) WHERE claim_id IS NULL`);
-      this.sql.exec(`CREATE INDEX IF NOT EXISTS jobs_deadline ON jobs (expires_at)`);
+      this.sql.exec("DROP INDEX IF EXISTS jobs_deadline");
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS jobs_waiting_deadline
+        ON jobs (expires_at) WHERE stream_started = 0`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS expired_claims (
         claim_id TEXT PRIMARY KEY,
         purge_at INTEGER NOT NULL
@@ -128,6 +137,7 @@ export class Broker {
       expiresAt,
       resolve,
       streaming: (JSON.parse(body) as ChatRequest).stream === true,
+      streamStarted: false,
       signal: request.signal,
       abort,
       timer: setTimeout(() => this.onTimeout(id), Math.max(0, expiresAt - Date.now())),
@@ -192,7 +202,7 @@ export class Broker {
     }
     const now = Date.now();
     const job = this.sql.exec<JobRow>(
-      `SELECT id, claim_id, expires_at, request_json, runtime_id
+      `SELECT id, claim_id, expires_at, stream_started, request_json, runtime_id
        FROM jobs WHERE claim_id = ?`, delivery.id,
     ).toArray()[0];
     if (!job) {
@@ -205,7 +215,7 @@ export class Broker {
         : apiError(404, "Unknown or already delivered claim.", "claim_not_found");
     }
     const waiter = this.waiters.get(job.id);
-    if (job.expires_at <= now || !waiter || waiter.signal.aborted) {
+    if ((!job.stream_started && job.expires_at <= now) || !waiter || waiter.signal.aborted) {
       // The agent need not know its caller left: discard the result and acknowledge it.
       this.expire(job.id, this.timeoutResponse());
       await this.scheduleAlarm();
@@ -234,7 +244,7 @@ export class Broker {
     }
     const now = Date.now();
     const job = this.sql.exec<JobRow>(
-      `SELECT id, claim_id, expires_at, request_json, runtime_id
+      `SELECT id, claim_id, expires_at, stream_started, request_json, runtime_id
        FROM jobs WHERE claim_id = ?`, claimId,
     ).toArray()[0];
     let waiter = job ? this.waiters.get(job.id) : undefined;
@@ -246,7 +256,7 @@ export class Broker {
       if (!expired) {
         return apiError(404, "Unknown or already delivered claim.", "claim_not_found");
       }
-    } else if (job.expires_at <= now || !waiter || waiter.signal.aborted) {
+    } else if ((!job.stream_started && job.expires_at <= now) || !waiter || waiter.signal.aborted) {
       this.expire(job.id, this.timeoutResponse());
       waiter = undefined;
     } else if (!waiter.streaming) {
@@ -331,10 +341,16 @@ export class Broker {
     relay: StreamRelay | undefined,
   ): Promise<void> {
     const reader = body.getReader();
+    let firstChunk = true;
     try {
       for (;;) {
         const chunk = await reader.read();
         if (chunk.done) break;
+        if (chunk.value.byteLength === 0) continue;
+        if (firstChunk) {
+          firstChunk = false;
+          if (jobId !== undefined && relay) this.startStream(jobId);
+        }
         // One input chunk at a time; no JSON parsing, decoding or accumulation.
         if (relay) await relay.push(chunk.value);
       }
@@ -353,9 +369,22 @@ export class Broker {
     }
   }
 
+  private startStream(id: number): void {
+    const waiter = this.waiters.get(id);
+    if (!waiter || waiter.streamStarted) return;
+    if (waiter.expiresAt <= Date.now()) {
+      this.expire(id, this.timeoutResponse());
+      return;
+    }
+    waiter.streamStarted = true;
+    clearTimeout(waiter.timer);
+    this.sql.exec("UPDATE jobs SET stream_started = 1 WHERE id = ?", id);
+    this.state.waitUntil(this.scheduleAlarm());
+  }
+
   private onTimeout(id: number): void {
     const waiter = this.waiters.get(id);
-    if (!waiter) return;
+    if (!waiter || waiter.streamStarted) return;
     const remaining = waiter.expiresAt - Date.now();
     if (remaining > 0) {
       waiter.timer = setTimeout(() => this.onTimeout(id), remaining);
@@ -404,7 +433,7 @@ export class Broker {
       if (deadline <= now) this.cancelledRequests.delete(requestId);
     }
     const expired = this.sql.exec<{ id: number }>(
-      `SELECT id FROM jobs WHERE expires_at <= ? OR runtime_id <> ?
+      `SELECT id FROM jobs WHERE (stream_started = 0 AND expires_at <= ?) OR runtime_id <> ?
        ORDER BY id LIMIT ?`, now, this.runtimeId, CLEANUP_BATCH_SIZE,
     ).toArray();
     for (const job of expired) this.expire(job.id, this.timeoutResponse());
@@ -422,7 +451,7 @@ export class Broker {
     ).toArray()[0];
     let { deadline } = this.sql.exec<{ deadline: number | null }>(
       `SELECT MIN(deadline) AS deadline FROM (
-         SELECT MIN(expires_at) AS deadline FROM jobs
+         SELECT MIN(expires_at) AS deadline FROM jobs WHERE stream_started = 0
          UNION ALL
          SELECT MIN(purge_at) AS deadline FROM expired_claims
        )`,
