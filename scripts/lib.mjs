@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { Readable } from "node:stream";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -133,10 +134,33 @@ export async function deliver(config, body, signal) {
 
 export async function deliverStream(config, id, body, signal) {
   if (!validId(id)) throw new Error("A claim UUID from /beg is required for streaming delivery.");
-  // Node fetch consumes Node Readables and web ReadableStreams incrementally,
-  // applying backpressure instead of collecting the SSE upload in memory.
-  const { status, text } = await post(config, "/deliver", body, signal, id);
-  return acceptedDelivery(status, text);
+  // Do not open an idle HTTP connection while the Agent is still warming up.
+  // Prefetch only the first nonempty chunk, then retain normal backpressure.
+  const source = body instanceof ReadableStream ? body
+    : Readable.toWeb(Readable.from(body, { objectMode: false, highWaterMark: 0 }));
+  const reader = source.getReader();
+  const cancel = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    if (signal?.aborted) { cancel(); throw signal.reason; }
+    let first = await reader.read();
+    while (!first.done && first.value.byteLength === 0) first = await reader.read();
+    if (signal?.aborted) throw signal.reason;
+    async function* chunks() {
+      if (!first.done) yield first.value;
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) return;
+        yield chunk.value;
+      }
+    }
+    const { status, text } = await post(config, "/deliver", chunks(), signal, id);
+    return acceptedDelivery(status, text);
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    cancel();
+    reader.releaseLock();
+  }
 }
 
 function acceptedDelivery(status, text) {

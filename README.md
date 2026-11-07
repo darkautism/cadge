@@ -74,6 +74,8 @@ curl -i http://localhost:8787/beg \
 
 Agent 可以自行選擇如何取得答案。如果轉送至真正的 OpenAI provider，應自行映射模型識別字，並依 `job.request.stream` 選擇模式：非串流交付完整 completion；`stream: true` 則立即轉送上游原始 OpenAI SSE，不要先收集整份結果，也不要把 SSE 文字當 completion JSON。
 
+Agent 領取工作即承諾在 `expires_at` 前完成交付。**不另外設定首段或相鄰 chunk 的短秒數時限**：暖機慢、例如 50 秒才開始送資料，只要整筆請求尚未到期仍可交付；不會因為幾秒沒有輸出就判定 Agent 死亡。排隊、暖機與整段串流共用原始時間預算，收到 chunk 不會重設 deadline。
+
 ### 3. Agent 交付
 
 #### 非串流交付
@@ -119,6 +121,8 @@ curl http://localhost:8787/deliver \
 上例重播 SSE 檔案；即時使用時，將自己的 SSE producer 接到 curl 的 stdin。`--upload-file -` 會邊讀邊上傳；不要使用會先讀完整份 stdin 的 `--data-binary @-`。也可直接使用下方的 `deliver.mjs --stream` 或 polling adapter。
 
 Cadge 收到資料就轉送給原始 Client，**不等 Agent 上傳結束**；使用下游背壓限制記憶體，不累積完整答案。SSE 註解、UTF-8、文字／tool call chunks、usage 與 `[DONE]` 均原樣傳遞。Cadge 不解析或補造正常 SSE 內容；Agent 必須產生有效的 OpenAI SSE。
+
+自訂 Agent 應先等首段 SSE 準備好，再建立 `/deliver` 上傳，而不是暖機前先開一條沒有資料的連線。repo 的 `deliver.mjs --stream` 與 `poll.mjs` 已自動採此方式：只預讀首個非空 chunk，隨即建立 HTTP 上傳並逐段轉送，避免暖機期間空等的上傳連線被對端／代理關閉；不會因此累積整份答案。這是上傳初始化的處理，不是新增首字時限。
 
 Agent 的上傳讀到 EOF 後才回 `200 {"accepted":true}`。Client 中途離開時停止轉送，但持續讀取並丟棄 Agent 剩餘串流，最後仍回相同收件成功，不中斷或通知 Agent。
 
@@ -181,6 +185,13 @@ HTTP 連線與記憶體中的等待者不能跨 runtime 重啟還原。重啟時
 - `stream: true`：Agent 上傳 raw OpenAI SSE，Cadge 立即逐段 relay，不等完整答案，也不將完整 JSON 轉成模擬串流。
 - `stream_options.include_usage: true`：保留在原始工作中；由 Agent 產生 usage SSE，Cadge 原樣轉送，不自行計算或補上 usage。
 - 等待過程不發送 SSE heartbeat；Client、代理或其他上游需容許設定的等待時間。
+
+### 長串流與平台限制
+
+[Cloudflare HTTP Workers](https://developers.cloudflare.com/workers/platform/limits/#duration) 與 [Durable Object HTTP](https://developers.cloudflare.com/durable-objects/platform/limits/#wall-time-limits-by-invocation-type) 在呼叫端保持連線時沒有固定 wall-clock 執行時限，不是每 30 秒必須收到一個 chunk。CPU 限制不包含等待網路資料的時間；`waitUntil()` 的 30 秒寬限是回應結束／斷線後的背景工作限制，不是正常串流上限。平台仍有 CPU、記憶體等限制，連線也可能因 runtime 更新或其他網路錯誤中斷。
+
+Cadge 自己的 `REQUEST_TIMEOUT_MS` 從入列起算，預設 120 秒，包含排隊及整段串流；Client／代理也可能有各自的 timeout。Agent 分段寫入與 `accepted:true` 只代表交付端收件，不能單憑它們定位 Client 緩衝或中途斷線原因。Cadge 不主動插入 heartbeat；上游的 SSE 註解照原樣轉送，但不會延長總 deadline。
+
 
 ## Agent hooks
 
