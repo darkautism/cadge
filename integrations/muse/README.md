@@ -116,10 +116,10 @@ the network is backpressured.
 
 `start_stream.sh` passes `CADGE_EXPIRES_AT` (Unix milliseconds) to the uploader
 as an optional first-byte deadline. The first nonempty packet must reach the
-server before the original claim deadline (normally 120 seconds). Then the
+server before the original claim deadline (normally 600 seconds). Then the
 server disarms that deadline permanently. There is **no** post-first-byte
 producer idle limit or whole-stream duration limit: a 75-second pause and a
-stream longer than 120 seconds are allowed. The 30-second network timeout
+stream outliving its initial deadline are allowed. The 30-second network timeout
 applies only within each finite HTTP exchange, never while waiting for
 producer bytes. It is not a streaming-lifetime workaround.
 

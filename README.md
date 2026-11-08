@@ -43,7 +43,7 @@ curl http://localhost:8787/v1/chat/completions \
   -d '{"model":"cadge","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-這個連線會等待交付，預設 120 秒包含佇列與首段 SSE 等待；串流首段資料到達後永久解除此期限，非串流則必須在期限內完成。既有 OpenAI Chat provider 設定 `base_url=https://<worker-host>/v1`、API key 為 `CLIENT_TOKEN`、model 為 `MODEL_ID`；呼叫端也必須容許長串流。即時串流請在 body 加上 `"stream":true`；用 curl 觀察時加 `-N`，避免終端輸出被 curl 緩衝。
+這個連線會等待交付，預設 600 秒包含佇列與首段 SSE 等待；串流首段資料到達後永久解除此期限，非串流則必須在期限內完成。既有 OpenAI Chat provider 設定 `base_url=https://<worker-host>/v1`、API key 為 `CLIENT_TOKEN`、model 為 `MODEL_ID`；呼叫端也必須容許長串流。即時串流請在 body 加上 `"stream":true`；用 curl 觀察時加 `-N`，避免終端輸出被 curl 緩衝。
 
 ### 2. Agent 乞討
 
@@ -74,7 +74,7 @@ curl -i http://localhost:8787/beg \
 
 Agent 可以自行選擇如何取得答案。如果轉送至真正的 OpenAI provider，應自行映射模型識別字，並依 `job.request.stream` 選擇模式：非串流交付完整 completion；`stream: true` 則立即轉送上游原始 OpenAI SSE，不要先收集整份結果，也不要把 SSE 文字當 completion JSON。
 
-Agent 應在 `expires_at` 前交付首個非空 SSE chunk；僅認領或開啟上傳標頭不算開始回覆。**首段資料到達後立即解除 deadline，不再限制整段串流總時長或相鄰 chunk 間隔**，不因沉默幾秒或原始 120 秒已到而中斷。暖機慢、例如 50 秒才開始送資料，只要首段仍在初始期限內即可。非串流請求則必須在初始期限內交付完整 completion。
+Agent 應在 `expires_at` 前交付首個非空 SSE chunk；僅認領或開啟上傳標頭不算開始回覆。**首段資料到達後立即解除 deadline，不再限制整段串流總時長或相鄰 chunk 間隔**，不因沉默幾秒或原始 600 秒已到而中斷。暖機慢、例如 50 秒才開始送資料，只要首段仍在初始期限內即可。非串流請求則必須在初始期限內交付完整 completion。
 
 ### 3. Agent 交付
 
@@ -196,7 +196,7 @@ HTTP 連線與記憶體中的等待者不能跨 runtime 重啟還原。重啟時
 
 `wrangler.jsonc` 已顯式啟用 `enable_request_signal`。入口收到 abort 後，以 `ctx.waitUntil` 發出不帶已取消 signal 的內部取消通知，確保 Durable Object 執行清理；不只依賴跨服務轉傳 AbortSignal。
 
-**停止等待不一定等於取消 HTTP。** Client 端若只做 `Promise.race`／忽略回應，卻沒有 abort／close 實際連線，伺服器無從知道；網路中斷、代理或 runtime 也可能延遲／沒有傳遞取消通知。尚未開始回覆的請求仍由 `REQUEST_TIMEOUT_MS`（預設 120 秒）清理；已開始的串流則等待 EOF、傳輸失敗或實際取消通知，沒有另一個總時長／idle timeout，不能承諾所有 `Ctrl-C` 都在固定毫秒內被偵測。
+**停止等待不一定等於取消 HTTP。** Client 端若只做 `Promise.race`／忽略回應，卻沒有 abort／close 實際連線，伺服器無從知道；網路中斷、代理或 runtime 也可能延遲／沒有傳遞取消通知。尚未開始回覆的請求仍由 `REQUEST_TIMEOUT_MS`（預設 600 秒）清理；已開始的串流則等待 EOF、傳輸失敗或實際取消通知，沒有另一個總時長／idle timeout，不能承諾所有 `Ctrl-C` 都在固定毫秒內被偵測。
 
 本機的 Wrangler／Miniflare 代理不一定轉傳斷線事件。取消回歸測試直接連 workerd socket，以真實 TCP reset 驗證；普通 TCP FIN 是半關閉，可能要等後續寫入才偵測到。正式環境的代理／Client 取消行為仍需在自己的部署驗證。
 
@@ -213,7 +213,7 @@ HTTP 連線與記憶體中的等待者不能跨 runtime 重啟還原。重啟時
 
 [Cloudflare HTTP Workers](https://developers.cloudflare.com/workers/platform/limits/#duration) 與 [Durable Object HTTP](https://developers.cloudflare.com/durable-objects/platform/limits/#wall-time-limits-by-invocation-type) 在呼叫端保持連線時沒有固定 wall-clock 執行時限，不是每 30 秒必須收到一個 chunk。CPU 限制不包含等待網路資料的時間；`waitUntil()` 的 30 秒寬限是回應結束／斷線後的背景工作限制，不是正常串流上限。平台仍有 CPU、記憶體等限制，連線也可能因 runtime 更新或其他網路錯誤中斷。
 
-Cadge 自己的 `REQUEST_TIMEOUT_MS` 從入列起算，預設 120 秒，僅限制排隊與等待首段 SSE 的時間；非串流則等待完整回覆。首個非空 SSE chunk 到達後解除期限，沒有串流總時長或 chunk idle timeout，也不需要 heartbeat 延命。Client／代理仍可能有各自的 timeout。Agent 分段寫入與 `accepted:true` 只代表交付端收件，不能單憑它們定位 Client 緩衝或中途斷線原因。Cadge 不主動插入 heartbeat；上游的 SSE 註解照原樣轉送。
+Cadge 自己的 `REQUEST_TIMEOUT_MS` 從入列起算，預設 600 秒，僅限制排隊與等待首段 SSE 的時間；非串流則等待完整回覆。首個非空 SSE chunk 到達後解除期限，沒有串流總時長或 chunk idle timeout，也不需要 heartbeat 延命。Client／代理仍可能有各自的 timeout。Agent 分段寫入與 `accepted:true` 只代表交付端收件，不能單憑它們定位 Client 緩衝或中途斷線原因。Cadge 不主動插入 heartbeat；上游的 SSE 註解照原樣轉送。
 
 
 ## Agent hooks
@@ -442,7 +442,7 @@ WAF 保護的是未授權的邊緣流量，不是「保證永不超額」；白�
 | 設定 | 預設值 | 說明 |
 |---|---|---|
 | `MODEL_ID` | `cadge` | 對 Client 公告並接受的模型識別字 |
-| `REQUEST_TIMEOUT_MS` | `120000` | 100–600000 毫秒，含佇列與首段 SSE 等待；首段後解除。非串流等待完整回覆 |
+| `REQUEST_TIMEOUT_MS` | `600000` | 100–600000 毫秒，含佇列與首段 SSE 等待；首段後解除。非串流等待完整回覆 |
 | `CLIENT_TOKEN` | 無 | Client 用 secret |
 | `AGENT_TOKEN` | 無 | Agent 用 secret，不能與 Client 相同 |
 

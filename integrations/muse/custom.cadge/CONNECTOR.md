@@ -151,14 +151,14 @@ after its first bytes and requires operator intervention.
 ### Deadlines and failure semantics
 
 `CADGE_EXPIRES_AT`, supplied by start, is an optional **first-byte** deadline
-in Unix milliseconds. Normally it is 120 seconds from enqueue. The first
+in Unix milliseconds. Normally it is 600 seconds from enqueue. The first
 nonempty packet must reach the server before that original deadline. Its
 arrival permanently disarms the server deadline. The uploader likewise stops
 applying its producer deadline after its first nonempty read; the server is
 authoritative if network delivery arrives late.
 
 There is no producer-idle or whole-stream lifetime limit after first bytes.
-A 75-second producer silence or stream longer than 120 seconds is valid.
+A 75-second producer silence or stream outliving its initial deadline is valid.
 The 30-second socket timeout is per finite HTTP exchange, not a wait for
 producer data. Bounded reads/pipe buffers bound memory; the growing on-disk
 file can grow while the uploader is backpressured.
