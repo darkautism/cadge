@@ -288,6 +288,17 @@ bash integrations/muse/install.sh
 
 串流 worker 使用 `start_stream.sh` 建立每個完整 claim UUID 專用的串流檔，逐段 append SSE，最後呼叫 `finish_stream.sh <dir>`。完成 helper 依明確的 producer EOF 標記排空所有位元組並等待最後 ACK，不再猜測 sleep 兩秒或 kill tail 的時機。首段後沒有 producer idle／總時長期限。詳細介面見 [Muse integration](integrations/muse/README.md)。
 
+不想 clone repo 時，可從 [Muse packet-stream release](https://github.com/darkautism/cadge/releases/tag/muse-packet-stream-20261108) 取得同一套已驗證的更新包。在空目錄執行（需要已登入且有 repo 存取權的 GitHub CLI）：
+
+```sh
+gh release download muse-packet-stream-20261108 --repo darkautism/cadge --pattern cadge-muse-packet-stream.tar.gz
+tar -xzf cadge-muse-packet-stream.tar.gz
+bash muse/install.sh
+```
+
+此包對應 `0ef7f820c487a381c91eb9e606b3b5eadc088837`，SHA-256 為 `1592f272179d448ed10242839d27ae42f76a6a2c871c7da2d42e1cc3b760973a`。安裝後仍須由 operator 註冊／確認 Muse credential、匯入 hook JSON 並明確啟用；下載或安裝不等於遠端已啟用。
+
+
 ## 部署到 Cloudflare
 
 ### 1. 安裝與登入

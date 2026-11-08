@@ -130,6 +130,18 @@ without `[DONE]`; never send a JSON error over an active SSE claim.
 
 ## Verification status
 
-This integration's local/live verification and final archive packing are
-performed by the parent task after integration. No claims about production
-success are inferred from the original bundle's historical notes.
+Canonical source is tracked in `integrations/muse/`. The installable
+[packet-stream release](https://github.com/darkautism/cadge/releases/tag/muse-packet-stream-20261108)
+contains the tested bundle from commit `0ef7f820c487a381c91eb9e606b3b5eadc088837`;
+its SHA-256 is `1592f272179d448ed10242839d27ae42f76a6a2c871c7da2d42e1cc3b760973a`.
+Download `cadge-muse-packet-stream.tar.gz`, extract it, and run
+`bash muse/install.sh` (the archive uses a `muse/` top-level directory).
+
+The GitHub-hosted asset was downloaded and installed into an isolated HOME
+from a different working directory, including paths with spaces. The smoke
+confirmed executable helpers, obsolete FIFO-helper removal, preservation of
+an unrelated HOME file, and a disabled hook after installation.
+
+Cloud transport verification used a test-only direct Bearer adapter, not the
+remote Muse scheduler or Vault proxy. No remote Muse installation, credential
+registration, or hook activation is implied; those remain operator actions.
